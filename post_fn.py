@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, Response
 
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 from utils.logger import log
+from moe_config import load_moe_config
 
 app = FastAPI()
 
@@ -63,8 +64,9 @@ class PostModel(nn.Module):
 
 def init_post_model() -> Dict[str, Any]:
     vocab_size = int(os.getenv("VOCAB_SIZE", "2000"))
-    d_model = int(os.getenv("EMB_DIM", "256"))
-    n_layers = int(os.getenv("N_LAYERS_POST", "2"))
+    moe_cfg = load_moe_config()
+    d_model = moe_cfg.d_model
+    n_layers = moe_cfg.num_post_layers
     n_heads = int(os.getenv("N_HEADS_POST", "4"))
     dropout = float(os.getenv("DROPOUT_POST", "0.1"))
 

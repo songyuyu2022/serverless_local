@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fastapi import FastAPI, Request, Response
-
+from moe_config import load_moe_config
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor, route_pack
 from utils.logger import log  # 需要 utils/logger.py
 
@@ -135,43 +135,25 @@ def load_expert_instance_table() -> Dict[str, List[Dict[str, Any]]]:
 
 EXPERT_INSTANCE_TABLE: Dict[str, List[Dict[str, Any]]] = load_expert_instance_table()
 
-# 基于 experts 表推断 NUM_EXPERTS / TOP_K
-env_num_experts = os.getenv("NUM_EXPERTS", "").strip()
-if env_num_experts:
-    try:
-        NUM_EXPERTS = int(env_num_experts)
-        assert NUM_EXPERTS > 0
-        log("pre_fn", f"使用环境变量 NUM_EXPERTS={NUM_EXPERTS}")
-    except Exception:
-        raise RuntimeError(f"NUM_EXPERTS 环境变量非法: '{env_num_experts}'")
-else:
-    if EXPERT_INSTANCE_TABLE:
-        NUM_EXPERTS = max(1, len(EXPERT_INSTANCE_TABLE))
-    else:
-        NUM_EXPERTS = 1
-    log("pre_fn", f"从 experts 表推断 NUM_EXPERTS={NUM_EXPERTS}")
+# 从 moe_config 读取 MoE 配置，优先使用配置文件中的默认值，必要时根据 experts 表推断专家数量
+MOE_CONFIG = load_moe_config(EXPERT_INSTANCE_TABLE or None)
 
-env_top_k = os.getenv("TOP_K", "").strip()
-if env_top_k:
-    try:
-        TOP_K = int(env_top_k)
-        assert 1 <= TOP_K <= NUM_EXPERTS
-        log("pre_fn", f"使用环境变量 TOP_K={TOP_K}")
-    except Exception:
-        raise RuntimeError(
-            f"TOP_K 环境变量非法: '{env_top_k}', 必须满足 1<=TOP_K<=NUM_EXPERTS={NUM_EXPERTS}"
-        )
+# 基于配置确定专家数量和 top-k
+if EXPERT_INSTANCE_TABLE:
+    NUM_EXPERTS = max(MOE_CONFIG.num_experts, len(EXPERT_INSTANCE_TABLE))
 else:
-    TOP_K = min(2, NUM_EXPERTS)
-    log("pre_fn", f"未设置 TOP_K，默认 TOP_K={TOP_K}")
+    NUM_EXPERTS = MOE_CONFIG.num_experts
+
+    TOP_K = min(MOE_CONFIG.top_k, NUM_EXPERTS)
+    log("pre_fn", f"MoE 配置: num_experts={NUM_EXPERTS}, top_k={TOP_K}")
 
 # ============================================================
 # 2. 模型定义（极简版 pre 模型）
 # ============================================================
 
 VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "2000"))
-EMB_DIM = int(os.getenv("EMB_DIM", "256"))
-N_LAYERS_PRE = int(os.getenv("N_LAYERS_PRE", "2"))
+EMB_DIM = MOE_CONFIG.d_model
+N_LAYERS_PRE = MOE_CONFIG.num_pre_layers
 N_HEADS_PRE = int(os.getenv("N_HEADS_PRE", "4"))
 DROPOUT_PRE = float(os.getenv("DROPOUT_PRE", "0.1"))
 MAX_SEQ_LEN = int(os.getenv("BLOCK_SIZE", "128"))

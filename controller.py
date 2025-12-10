@@ -35,6 +35,7 @@ from scheduler_lgbm import record_lgb_training_sample
 from utils.logger import log
 from utils.metrics import MetricsLogger, StepMetrics
 from comm import CommManager
+from moe_config import load_moe_config
 
 # ----------------- 全局配置 -----------------
 
@@ -53,7 +54,8 @@ DEFAULT_PRICE_CENTS_S = float(os.getenv("DEFAULT_PRICE_CENTS_S", "0.0"))
 MICRO_BATCHES = int(os.getenv("MICRO_BATCHES", "1"))
 
 # MoE 路由超参（用于 controller 端的 expert fwd）
-TOP_K_DEFAULT = int(os.getenv("TOP_K", "2"))
+MOE_CONFIG = None  # 稍后在加载完函数映射后初始化
+TOP_K_DEFAULT = 2
 
 # ----------------- 统一函数实例池 & 函数映射 -----------------
 
@@ -114,6 +116,12 @@ log(
     f"POST_STEP_INSTANCES={len(POST_STEP_INSTANCE_IDS)}, "
     f"EXPERT_INSTANCES={len(EXPERT_INSTANCE_IDS)}",
 )
+
+# 初始化 MoE 配置（优先读取 moe_config 中的默认值，再结合 experts 映射）
+MOE_CONFIG = load_moe_config(
+    {k: v for k, v in FUNC_MAP.items() if k.startswith("moe.expert_fwd:")}
+)
+TOP_K_DEFAULT = MOE_CONFIG.top_k
 
 # ----------------- 函数候选实例获取 & 调度封装 -----------------
 

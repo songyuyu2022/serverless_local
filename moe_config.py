@@ -21,6 +21,14 @@ class MoeConfig:
     num_pre_layers: int
     num_post_layers: int
 
+# 默认 MoE 配置，后续调整超参时可以直接修改这里，无需设置环境变量
+DEFAULT_MOE_CONFIG = MoeConfig(
+    num_experts=1,
+    top_k=2,
+    d_model=256,
+    num_pre_layers=2,
+    num_post_layers=2,
+)
 
 def load_moe_config(expert_instances: Optional[Dict[str, Any]] = None) -> MoeConfig:
     """从环境变量 + experts.json 推断 MoE 配置。
@@ -35,10 +43,14 @@ def load_moe_config(expert_instances: Optional[Dict[str, Any]] = None) -> MoeCon
     - 改 TOP_K，就能控制 top-k 数量
     """
 
-    # 与现有环境变量保持兼容
-    d_model = int(os.getenv("EMB_DIM", "256"))
-    num_pre_layers = int(os.getenv("N_LAYERS_PRE", "2"))
-    num_post_layers = int(os.getenv("N_LAYERS_POST", os.getenv("N_LAYERS", "2")))
+    # 从默认配置读取，若设置了环境变量则以环境变量覆盖，保持兼容
+    d_model = int(os.getenv("EMB_DIM", str(DEFAULT_MOE_CONFIG.d_model)))
+    num_pre_layers = int(
+        os.getenv("N_LAYERS_PRE", str(DEFAULT_MOE_CONFIG.num_pre_layers))
+    )
+    num_post_layers = int(
+        os.getenv("N_LAYERS_POST", os.getenv("N_LAYERS", str(DEFAULT_MOE_CONFIG.num_post_layers)))
+    )
 
     # 专家数量：优先 NUM_EXPERTS，其次 experts.json
     num_experts_env = os.getenv("NUM_EXPERTS")
@@ -51,10 +63,10 @@ def load_moe_config(expert_instances: Optional[Dict[str, Any]] = None) -> MoeCon
         if expert_instances:
             num_experts = max(1, len(expert_instances))
         else:
-            num_experts = 1
+            num_experts = DEFAULT_MOE_CONFIG.num_experts
 
     # top-k：统一由 TOP_K 控制
-    top_k = int(os.getenv("TOP_K", "2"))
+    top_k = int(os.getenv("TOP_K", str(DEFAULT_MOE_CONFIG.top_k)))
 
     return MoeConfig(
         num_experts=num_experts,

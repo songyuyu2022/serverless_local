@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, Response
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 from comm import CommManager
 from utils.logger import log
-
+from moe_config import load_moe_config
 
 app = FastAPI()
 
@@ -40,7 +40,8 @@ class ExpertMLP(nn.Module):
 
 
 def init_expert() -> Dict[str, Any]:
-    dim = int(os.getenv("EMB_DIM", "256"))
+    moe_cfg = load_moe_config()
+    dim = moe_cfg.d_model
     lr = float(os.getenv("LR_EXPERT", os.getenv("LR", "1e-3")))
     weight_decay = float(os.getenv("WD_EXPERT", "0.0"))
 

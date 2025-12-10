@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Tuple
 
 from scheduler_lgbm import LGBMScheduler, DEFAULT_LGBM_SCHED
 from utils.logger import log
-
+from scheduler_nn import NNScheduler, NN_SCHED
 
 class HybridScheduler:
     """
@@ -38,9 +38,21 @@ class HybridScheduler:
       - 预留位置，后续可以在这里加入 NN 残差调度等再做融合。
     """
 
-    def __init__(self, lgbm_sched: LGBMScheduler | None = None) -> None:
+    def __init__(
+            self,
+            lgbm_sched: LGBMScheduler | None = None,
+            nn_sched: NNScheduler | None = None,
+    ) -> None:
         # 若外部没有传入，就使用 scheduler_lgbm 中的全局默认实例
         self.lgbm_sched = lgbm_sched or DEFAULT_LGBM_SCHED
+        self.nn_sched = nn_sched or NN_SCHED
+
+    def _use_nn_scheduler(self, func_type: str, top_k: int) -> bool:
+        return (
+                self.nn_sched is not None
+                and top_k == 1
+                and func_type.startswith("moe.expert")
+        )
 
     def select_instances(
         self,
@@ -64,13 +76,22 @@ class HybridScheduler:
         if not instances:
             raise RuntimeError("HybridScheduler.select_instances: instances 为空")
 
-        chosen, scores = self.lgbm_sched.select_instances(
-            func_type=func_type,
-            logical_id=logical_id,
-            instances=instances,
-            req=req,
-            top_k=top_k,
-        )
+        if self._use_nn_scheduler(func_type, top_k):
+            inst, score = self.nn_sched.select_instance(
+                expert_id=logical_id,
+                instances=instances,
+                req=req,
+            )
+            chosen = [inst]
+            scores = [score]
+        else:
+            chosen, scores = self.lgbm_sched.select_instances(
+                func_type=func_type,
+                logical_id=logical_id,
+                instances=instances,
+                req=req,
+                top_k=top_k,
+            )
 
         log(
             "hybrid-scheduler",
