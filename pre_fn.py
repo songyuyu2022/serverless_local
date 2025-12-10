@@ -144,8 +144,8 @@ if EXPERT_INSTANCE_TABLE:
 else:
     NUM_EXPERTS = MOE_CONFIG.num_experts
 
-    TOP_K = min(MOE_CONFIG.top_k, NUM_EXPERTS)
-    log("pre_fn", f"MoE 配置: num_experts={NUM_EXPERTS}, top_k={TOP_K}")
+TOP_K = min(MOE_CONFIG.top_k, NUM_EXPERTS)
+log("pre_fn", f"MoE 配置: num_experts={NUM_EXPERTS}, top_k={TOP_K}")
 
 # ============================================================
 # 2. 模型定义（极简版 pre 模型）
