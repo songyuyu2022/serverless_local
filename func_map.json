@@ -1,0 +1,10 @@
+{
+  "moe.pre_fwd": ["fn_pre_py_torch_gpu_1", "fn_pre_py_torch_cpu_1"],
+  "moe.post_fwd": ["fn_post_py_torch_gpu_1", "fn_post_py_torch_cpu_1"],
+
+  "moe.expert_fwd:0": ["fn_exp0_py_torch_gpu_1", "fn_exp0_py_torch_cpu_1"],
+  "moe.expert_fwd:1": ["fn_exp1_py_torch_gpu_1", "fn_exp1_cpp_onnx_cpu_1"],
+
+  "moe.expert_apply_grad:0": ["fn_exp0_py_torch_gpu_1", "fn_exp0_py_torch_cpu_1"],
+  "moe.expert_apply_grad:1": ["fn_exp1_py_torch_gpu_1", "fn_exp1_cpp_onnx_cpu_1"]
+}
