@@ -130,6 +130,7 @@ Start-Window -command @"
 `$env:TOP_K='2'; `$env:NUM_EXPERTS='2';  # 这里配置为 2 个逻辑专家：0 和 1
 `$env:BATCH_SIZE='4'; `$env:BLOCK_SIZE='64';
 `$env:MAX_STEPS='200'; `$env:VAL_INTERVAL='50'; `$env:LOG_TRAIN_EVERY='100';
+`$env:MICRO_BATCHES='4';  # 将 Batch Size 拆分为 4 个微批次
 python controller.py
 "@
 

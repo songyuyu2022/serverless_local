@@ -534,7 +534,7 @@ async def run_step(
                 if inst_e:
                     micro_result["dispatch_count"] += 1
                     inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
-                    micro_result["inst_choice_counts"][inst_id] +=
+                    micro_result["inst_choice_counts"][inst_id] += 1
 
             # 如果没有任何 expert 实例可用，就退回原始 h
             if not expert_to_tokens:
