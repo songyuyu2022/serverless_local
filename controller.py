@@ -425,8 +425,7 @@ async def run_step(
     t_step0 = time.perf_counter()
 
     # 调度/通信行为统计（论文指标）
-    hot_experts_global: List[int] = []
-    cold_experts_global: List[int] = []
+
     hot_experts_step = set()
     cold_experts_step = set()
     cold_total = 0
@@ -448,9 +447,25 @@ async def run_step(
         grad_bytes = 0
         expert_inst_cnt = len(EXPERT_INSTANCE_IDS)
 
-        for m in range(micro_batches):
-            x_mb = x_ids[m * micro_bs : (m + 1) * micro_bs]
-            y_mb = target_ids[m * micro_bs : (m + 1) * micro_bs]
+        async def run_microbatch(m: int, x_mb: torch.Tensor, y_mb: torch.Tensor) -> Dict[str, Any]:
+            micro_result: Dict[str, Any] = {
+                "loss": 0.0,
+                "acc_top1": 0.0,
+                "acc_top5": 0.0,
+                "pre_lat_ms": 0.0,
+                "post_lat_ms": 0.0,
+                "post_bwd_ms": 0.0,
+                "pre_bwd_ms": 0.0,
+                "expert_comm_ms": 0.0,
+                "grad_bytes": 0,
+                "dispatch_count": 0,
+                "inst_choice_counts": defaultdict(int),
+                "mode_counts": {"hot": 0, "cold": 0, "http": 0},
+                "hot_experts": set(),
+                "cold_experts": set(),
+                "cold_total": 0,
+                "cold_skipped": 0,
+            }
 
             # ---------- pre_fn / fwd ----------
             pre_resp, pre_lat_ms, pre_inst = await call_pre_fwd(
@@ -460,7 +475,7 @@ async def run_step(
                 tokens=tokens,
                 emb_dim=0,  # 这里暂时不用 emb_dim，可根据模型实际扩展
             )
-            pre_lat_all += pre_lat_ms
+            micro_result["pre_lat_ms"] = pre_lat_ms
 
             hidden_pack = pre_resp["hidden"]
             gate_pack = pre_resp["gate"]  # router logits
@@ -468,15 +483,11 @@ async def run_step(
 
             # 记录热/冷专家（根据 pre_fn 的统计）
             if "hot" in pre_resp:
-                hot_experts_micro = pre_resp["hot"]
-                cold_experts_micro = pre_resp.get("cold", [])
-                hot_experts_step.update(hot_experts_micro)
-                cold_experts_step.update(cold_experts_micro)
-                hot_experts_global = list(hot_experts_step)
-                cold_experts_global = list(cold_experts_step)
+                hot_experts_micro = set(pre_resp["hot"])
+                cold_experts_micro = set(pre_resp.get("cold", []))
+                micro_result["hot_experts"].update(hot_experts_micro)
+                micro_result["cold_experts"].update(cold_experts_micro)
 
-            # ---------- controller 内部执行真正 MoE 专家前向 ----------
-            # 将 hidden_pack 解包成 tensor
             h = pack_to_tensor(hidden_pack).float()  # (B_mb, T, D)
             router_logits = pack_to_tensor(gate_pack).float()  # (B_mb, T, E)
 
@@ -484,11 +495,9 @@ async def run_step(
             num_experts = router_logits.shape[-1]
             top_k = max(1, min(TOP_K_DEFAULT, num_experts))
 
-            # top-k + softmax
             topk_vals, topk_idx = torch.topk(router_logits, k=top_k, dim=-1)  # (B,T,K)
             gates = F.softmax(topk_vals, dim=-1)  # (B,T,K)
 
-            # 收集每个 expert 对应的 token 列表
             expert_to_tokens: Dict[int, List[Tuple[int, int, int, float]]] = {}
             topk_idx_np = topk_idx.cpu().numpy()
             gates_np = gates.cpu().numpy()
@@ -503,7 +512,7 @@ async def run_step(
             merged_h = torch.zeros_like(h)
 
             for eid, items in expert_to_tokens.items():
-                # 该 expert 对应的输入子 batch
+
                 idx_b = [b for (b, t, k_id, gw) in items]
                 idx_t = [t for (b, t, k_id, gw) in items]
                 x_e = h[idx_b, idx_t, :]  # (N, D)
@@ -514,7 +523,7 @@ async def run_step(
                     x_e=x_e,
                     emb_dim=D,
                 )
-                expert_comm_ms += lat_ms
+                micro_result["expert_comm_ms"] += lat_ms
 
                 # 将专家输出按 gate 写回 merged_h
                 i = 0
@@ -523,9 +532,9 @@ async def run_step(
                     i += 1
 
                 if inst_e:
-                    dispatch_count += 1
+                    micro_result["dispatch_count"] += 1
                     inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
-                    inst_choice_counts[inst_id] += 1
+                    micro_result["inst_choice_counts"][inst_id] +=
 
             # 如果没有任何 expert 实例可用，就退回原始 h
             if not expert_to_tokens:
@@ -545,16 +554,13 @@ async def run_step(
                 emb_dim=0,
                 train=train,
             )
-            post_lat_all += post_lat_ms
+            micro_result["post_lat_ms"] = post_lat_ms
 
-            loss = float(post_resp["loss"])
-            acc_top1 = float(post_resp.get("acc_top1", 0.0))
-            acc_top5 = float(post_resp.get("acc_top5", 0.0))
-            agg_loss += loss
-            agg_top1 += acc_top1
-            agg_top5 += acc_top5
+            micro_result["loss"] = float(post_resp["loss"])
+            micro_result["acc_top1"] = float(post_resp.get("acc_top1", 0.0))
+            micro_result["acc_top5"] = float(post_resp.get("acc_top5", 0.0))
 
-            # ---------- post_fn / bwd ----------
+
             if train:
                 t0 = time.perf_counter()
                 grads_pack = post_resp["grads"]
@@ -569,16 +575,12 @@ async def run_step(
                     headers={"Content-Type": "application/msgpack"},
                 )
                 t1 = time.perf_counter()
-                post_bwd_all += (t1 - t0) * 1000.0
+                micro_result["post_bwd_ms"] = (t1 - t0) * 1000.0
 
                 rb = loads(resp.content)
                 # 这里假设 rb 里包含 pre_grads / expert_grads 等
-                if "pre_grads" in rb:
-                    pre_grads = rb["pre_grads"]
-                else:
-                    pre_grads = None
+                pre_grads = rb.get("pre_grads")
 
-                # ---------- pre_fn / bwd ----------
                 if pre_grads is not None:
                     t0 = time.perf_counter()
                     await client.post(
@@ -592,26 +594,26 @@ async def run_step(
                         headers={"Content-Type": "application/msgpack"},
                     )
                     t1 = time.perf_counter()
-                    pre_bwd_all += (t1 - t0) * 1000.0
+                    micro_result["pre_bwd_ms"] = (t1 - t0) * 1000.0
 
                 # ---------- 专家梯度通信 (NSGA-II + 热/冷模式区分) ----------
                 if USE_NSGA2 and "expert_grads" in rb:
                     grads = rb["expert_grads"]
                     if grads:
-                        grad_bytes = _est_grad_bytes(grads)
+                        grad_bytes_local = _est_grad_bytes(grads)
+                        micro_result["grad_bytes"] = grad_bytes_local
                         log(
-                            "controller",
-                            f"[train] expert_grads size ≈ {grad_bytes / 1e6:.3f} MB, "
-                            f"hot={hot_experts_global}, cold={cold_experts_global}",
+                            f"[train] expert_grads size ≈ {grad_bytes_local / 1e6:.3f} MB, "
+                            f"hot={sorted(micro_result['hot_experts'])}, cold={sorted(micro_result['cold_experts'])}",
                         )
 
                         all_modes = feasible_modes()
 
                         # 本 step 参与路由的逻辑专家集合（来自 hot/cold）
                         expert_ids = set()
-                        for e in hot_experts_step:
+                        for e in micro_result["hot_experts"]:
                             expert_ids.add(e)
-                        for e in cold_experts_step:
+                        for e in micro_result["cold_experts"]:
                             expert_ids.add(e)
 
                         for eid_int in sorted(expert_ids):
@@ -623,13 +625,11 @@ async def run_step(
                             if not inst_list:
                                 continue
 
-                            # 冷专家统计总数（用于 cold_skip_ratio）
-                            if eid_int in cold_experts_step:
-                                cold_total += 1
+                            if eid_int in micro_result["cold_experts"]:
+                                micro_result["cold_total"] += 1
 
-                            # 冷专家降频：仅在部分 step 更新（发送梯度）
-                            if eid_int in cold_experts_step and (global_step % COLD_ACC_STEPS) != 0:
-                                cold_skipped += 1
+                            if eid_int in micro_result["cold_experts"] and (global_step % COLD_ACC_STEPS) != 0:
+                                micro_result["cold_skipped"] += 1
                                 log(
                                     "controller",
                                     f"[train] skip cold expert eid={eid_str} at step={global_step} "
@@ -637,10 +637,9 @@ async def run_step(
                                 )
                                 continue
 
-                            # 候选模式集合
-                            if eid_int in hot_experts_step:
+                            if eid_int in micro_result["hot_experts"]:
                                 candidate_modes = [m for m in all_modes if m in ("hot", "http")]
-                            elif eid_int in cold_experts_step:
+                            elif eid_int in micro_result["cold_experts"]:
                                 candidate_modes = [m for m in all_modes if m in ("cold", "http")]
                             else:
                                 candidate_modes = list(all_modes)
@@ -649,7 +648,7 @@ async def run_step(
                                 continue
 
                             req = {
-                                "grad_bytes": grad_bytes,
+                                "grad_bytes": grad_bytes_local,
                                 "price_cents_s": DEFAULT_PRICE_CENTS_S,
                             }
 
@@ -703,7 +702,7 @@ async def run_step(
                                 )
                             t_comm1 = time.perf_counter()
                             comm_latency_ms = (t_comm1 - t_comm0) * 1000.0
-                            expert_comm_ms += comm_latency_ms
+                            micro_result["expert_comm_ms"] += comm_latency_ms
 
                             # LightGBM 在线样本记录：expert 通信延迟
                             try:
@@ -720,14 +719,44 @@ async def run_step(
                                     f"[warn] record_lgb_training_sample(expert) failed: {e}",
                                 )
 
-                            # 调度行为统计
-                            dispatch_count += 1
-                            if mode in mode_counts:
-                                mode_counts[mode] += 1
+                            micro_result["dispatch_count"] += 1
+                            if mode in micro_result["mode_counts"]:
+                                micro_result["mode_counts"][mode] += 1
                             else:
-                                mode_counts[mode] = 1
+                                micro_result["mode_counts"][mode] = 1
                             inst_id = inst.get("id") or inst.get("url") or str(inst)
-                            inst_choice_counts[inst_id] += 1
+                            micro_result["inst_choice_counts"][inst_id] += 1
+
+                            return micro_result
+
+        micro_tasks = []
+        for m in range(micro_batches):
+            x_mb = x_ids[m * micro_bs: (m + 1) * micro_bs]
+            y_mb = target_ids[m * micro_bs: (m + 1) * micro_bs]
+            micro_tasks.append(run_microbatch(m, x_mb, y_mb))
+
+        micro_results = await asyncio.gather(*micro_tasks)
+
+        for res in micro_results:
+            agg_loss += res["loss"]
+            agg_top1 += res["acc_top1"]
+            agg_top5 += res["acc_top5"]
+            pre_lat_all += res["pre_lat_ms"]
+            post_lat_all += res["post_lat_ms"]
+            post_bwd_all += res["post_bwd_ms"]
+            pre_bwd_all += res["pre_bwd_ms"]
+            expert_comm_ms += res["expert_comm_ms"]
+            grad_bytes += res["grad_bytes"]
+            dispatch_count += res["dispatch_count"]
+            hot_experts_step.update(res["hot_experts"])
+            cold_experts_step.update(res["cold_experts"])
+            cold_total += res["cold_total"]
+            cold_skipped += res["cold_skipped"]
+
+            for mode_name, cnt in res["mode_counts"].items():
+                mode_counts[mode_name] = mode_counts.get(mode_name, 0) + cnt
+            for inst_id, cnt in res["inst_choice_counts"].items():
+                                inst_choice_counts[inst_id] += cnt
 
         # ---------- pre / post：所有共享参数模块 step ----------
         if train:
