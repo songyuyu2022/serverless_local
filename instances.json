@@ -3,53 +3,48 @@
     "id": "fn_pre_py_torch_gpu_1",
     "url": "http://127.0.0.1:8001",
     "runtime": "python3.11",
-    "memory_mb": 4096,
-    "cpu_cores": 2,
-    "disk_mb": 512,
-    "timeout_ms": 600000,
+    "memory_mb": 8192,
+    "cpu_cores": 4,
+    "disk_mb": 1024,
     "region": "local-a",
-    "az": "local-a-1",
     "meta": {
-      "lang": "python",
-      "libs": ["torch", "transformers"],
+      "desc": "Flagship GPU: Fast but Expensive",
       "device": "cuda",
-      "deployment_package_mb": 250,
-      "container_image": "moe-pre:py311-torch",
-      "version": "v1",
-      "cold_start_ms": 150.0,
-      "rtt_ms": 3.0,
-      "price_cents_s": 0.004
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 100.0,
+      "rtt_ms": 1.0,
+      "price_cents_s": 0.010
     }
   },
-
   {
     "id": "fn_pre_py_torch_cpu_1",
     "url": "http://127.0.0.1:8002",
     "runtime": "python3.10",
-    "memory_mb": 2048,
+    "memory_mb": 1024,
     "cpu_cores": 1,
     "disk_mb": 256,
-    "timeout_ms": 600000,
     "region": "local-a",
-    "az": "local-a-1",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Economy CPU: Cheap but Slow",
       "device": "cpu",
-      "deployment_package_mb": 200,
-      "container_image": "moe-pre:py310-torch",
-      "version": "v1",
-      "cold_start_ms": 200.0,
-      "rtt_ms": 6.0,
-      "price_cents_s": 0.001
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 50.0,
+      "rtt_ms": 5.0,
+      "price_cents_s": 0.0005
+    }
+  },
+  {
+    "id": "fn_pre_3",
+    "url": "http://127.0.0.1:8003",
+    "runtime": "python3.9",
+    "memory_mb": 4096,
+    "cpu_cores": 8,
+    "disk_mb": 512,
+    "region": "remote-x",
+    "meta": {
+      "desc": "Remote High-Compute: High Latency, Good Throughput",
+      "device": "cpu",
+      "cold_start_ms": 300.0,
+      "rtt_ms": 50.0,
+      "price_cents_s": 0.002
     }
   },
 
@@ -57,53 +52,48 @@
     "id": "fn_post_py_torch_gpu_1",
     "url": "http://127.0.0.1:8101",
     "runtime": "python3.11",
-    "memory_mb": 4096,
-    "cpu_cores": 2,
-    "disk_mb": 512,
-    "timeout_ms": 600000,
+    "memory_mb": 8192,
+    "cpu_cores": 4,
+    "disk_mb": 1024,
     "region": "local-a",
-    "az": "local-a-2",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Flagship GPU",
       "device": "cuda",
-      "deployment_package_mb": 280,
-      "container_image": "moe-post:py311-torch",
-      "version": "v1",
-      "cold_start_ms": 170.0,
-      "rtt_ms": 3.5,
-      "price_cents_s": 0.0045
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 100.0,
+      "rtt_ms": 1.2,
+      "price_cents_s": 0.010
     }
   },
-
   {
     "id": "fn_post_py_torch_cpu_1",
     "url": "http://127.0.0.1:8102",
     "runtime": "python3.9",
-    "memory_mb": 2048,
+    "memory_mb": 1024,
     "cpu_cores": 1,
     "disk_mb": 256,
-    "timeout_ms": 600000,
     "region": "local-a",
-    "az": "local-a-2",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Economy CPU",
       "device": "cpu",
-      "deployment_package_mb": 220,
-      "container_image": "moe-post:py39-torch",
-      "version": "v1",
-      "cold_start_ms": 210.0,
-      "rtt_ms": 7.0,
-      "price_cents_s": 0.0012
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 60.0,
+      "rtt_ms": 6.0,
+      "price_cents_s": 0.0006
+    }
+  },
+  {
+    "id": "fn_post_3",
+    "url": "http://127.0.0.1:8103",
+    "runtime": "python3.10",
+    "memory_mb": 4096,
+    "cpu_cores": 8,
+    "disk_mb": 512,
+    "region": "remote-x",
+    "meta": {
+      "desc": "Remote High-Compute",
+      "device": "cpu",
+      "cold_start_ms": 350.0,
+      "rtt_ms": 55.0,
+      "price_cents_s": 0.0022
     }
   },
 
@@ -111,53 +101,48 @@
     "id": "fn_exp0_py_torch_gpu_1",
     "url": "http://127.0.0.1:8201",
     "runtime": "python3.11",
-    "memory_mb": 8192,
-    "cpu_cores": 4,
-    "disk_mb": 1024,
-    "timeout_ms": 600000,
+    "memory_mb": 16384,
+    "cpu_cores": 8,
+    "disk_mb": 2048,
     "region": "local-b",
-    "az": "local-b-1",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Flagship GPU Expert",
       "device": "cuda",
-      "deployment_package_mb": 300,
-      "container_image": "moe-exp:py311-torch",
-      "version": "v1",
-      "cold_start_ms": 180.0,
-      "rtt_ms": 2.5,
-      "price_cents_s": 0.005
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 200.0,
+      "rtt_ms": 1.5,
+      "price_cents_s": 0.015
     }
   },
-
   {
     "id": "fn_exp0_py_torch_cpu_1",
     "url": "http://127.0.0.1:8202",
     "runtime": "python3.10",
-    "memory_mb": 4096,
+    "memory_mb": 2048,
     "cpu_cores": 2,
     "disk_mb": 512,
-    "timeout_ms": 600000,
     "region": "local-b",
-    "az": "local-b-1",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Economy CPU Expert",
       "device": "cpu",
-      "deployment_package_mb": 260,
-      "container_image": "moe-exp:py310-torch",
-      "version": "v1",
-      "cold_start_ms": 220.0,
-      "rtt_ms": 6.5,
-      "price_cents_s": 0.0015
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 80.0,
+      "rtt_ms": 7.0,
+      "price_cents_s": 0.001
+    }
+  },
+  {
+    "id": "fn_exp0_3",
+    "url": "http://127.0.0.1:8203",
+    "runtime": "python3.11",
+    "memory_mb": 32768,
+    "cpu_cores": 16,
+    "disk_mb": 4096,
+    "region": "remote-y",
+    "meta": {
+      "desc": "Remote Heavy Expert",
+      "device": "cpu",
+      "cold_start_ms": 500.0,
+      "rtt_ms": 60.0,
+      "price_cents_s": 0.004
     }
   },
 
@@ -165,53 +150,48 @@
     "id": "fn_exp1_py_torch_gpu_1",
     "url": "http://127.0.0.1:8211",
     "runtime": "python3.11",
-    "memory_mb": 8192,
-    "cpu_cores": 4,
-    "disk_mb": 1024,
-    "timeout_ms": 600000,
+    "memory_mb": 16384,
+    "cpu_cores": 8,
+    "disk_mb": 2048,
     "region": "local-b",
-    "az": "local-b-2",
     "meta": {
-      "lang": "python",
-      "libs": ["torch"],
+      "desc": "Flagship GPU Expert",
       "device": "cuda",
-      "deployment_package_mb": 300,
-      "container_image": "moe-exp:py311-torch",
-      "version": "v1",
-      "cold_start_ms": 180.0,
-      "rtt_ms": 2.8,
-      "price_cents_s": 0.005
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 200.0,
+      "rtt_ms": 1.8,
+      "price_cents_s": 0.015
     }
   },
-
   {
     "id": "fn_exp1_cpp_onnx_cpu_1",
     "url": "http://127.0.0.1:8212",
     "runtime": "custom-cpp",
-    "memory_mb": 4096,
+    "memory_mb": 2048,
     "cpu_cores": 2,
     "disk_mb": 512,
-    "timeout_ms": 600000,
     "region": "local-b",
-    "az": "local-b-2",
     "meta": {
-      "lang": "cpp",
-      "libs": ["onnxruntime"],
+      "desc": "Economy C++ Expert",
       "device": "cpu",
-      "deployment_package_mb": 180,
-      "container_image": "moe-exp:cpp-onnx",
-      "version": "v1",
-      "cold_start_ms": 120.0,
-      "rtt_ms": 4.0,
-      "price_cents_s": 0.002
-    },
-    "dyn": {
-      "avg_q_ms": 0.0,
-      "last_cold_start_ms": 0.0
+      "cold_start_ms": 40.0,
+      "rtt_ms": 8.0,
+      "price_cents_s": 0.0012
+    }
+  },
+  {
+    "id": "fn_exp1_3",
+    "url": "http://127.0.0.1:8213",
+    "runtime": "python3.8",
+    "memory_mb": 32768,
+    "cpu_cores": 16,
+    "disk_mb": 4096,
+    "region": "remote-y",
+    "meta": {
+      "desc": "Remote Heavy Expert",
+      "device": "cpu",
+      "cold_start_ms": 450.0,
+      "rtt_ms": 65.0,
+      "price_cents_s": 0.0042
     }
   }
 ]

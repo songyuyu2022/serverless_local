@@ -68,6 +68,12 @@ Start-Window -command @"
 uvicorn pre_fn:app --host 127.0.0.1 --port 8002
 "@
 
+# [新增] fn_pre_instance_3
+Start-Window -command @"
+`$env:TOP_K='2'; `$env:NUM_EXPERTS='2';
+uvicorn pre_fn:app --host 127.0.0.1 --port 8003
+"@
+
 # ============================================
 # 2. 启动 post_fn 的两个实例（8101 / 8102）
 # ============================================
@@ -82,6 +88,12 @@ uvicorn post_fn:app --host 127.0.0.1 --port 8101
 Start-Window -command @"
 `$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256';
 uvicorn post_fn:app --host 127.0.0.1 --port 8102
+"@
+
+# [新增] fn_post_instance_3
+Start-Window -command @"
+`$env:VOCAB_SIZE='2000'; `$env:EMB_DIM='256';
+uvicorn post_fn:app --host 127.0.0.1 --port 8103
 "@
 
 # ============================================
@@ -103,6 +115,11 @@ Start-Window -command @"
 uvicorn expert_app:app --host 127.0.0.1 --port 8202
 "@
 
+# [新增] expert0 - 实例 3
+Start-Window -command @"
+`$env:LOGICAL_EID='0'; `$env:EMB_DIM='256';
+uvicorn expert_app:app --host 127.0.0.1 --port 8203
+"@
 # ============================================
 # 4. 启动 expert1 的两个实例（8211 / 8212）
 #    来自：
@@ -122,6 +139,12 @@ Start-Window -command @"
 uvicorn expert_app:app --host 127.0.0.1 --port 8212
 "@
 
+# [新增] expert1 - 实例 3
+Start-Window -command @"
+`$env:LOGICAL_EID='1'; `$env:EMB_DIM='256';
+uvicorn expert_app:app --host 127.0.0.1 --port 8213
+"@
+
 # ============================================
 # 5. 启动 controller（训练控制器）
 # ============================================
@@ -129,8 +152,8 @@ uvicorn expert_app:app --host 127.0.0.1 --port 8212
 Start-Window -command @"
 `$env:TOP_K='2'; `$env:NUM_EXPERTS='2';  # 这里配置为 2 个逻辑专家：0 和 1
 `$env:BATCH_SIZE='4'; `$env:BLOCK_SIZE='64';
-`$env:MAX_STEPS='200'; `$env:VAL_INTERVAL='50'; `$env:LOG_TRAIN_EVERY='100';
-`$env:MICRO_BATCHES='4';  # 将 Batch Size 拆分为 4 个微批次
+`$env:MAX_STEPS='4200'; `$env:VAL_INTERVAL='50'; `$env:LOG_TRAIN_EVERY='100';
+`$env:MICRO_BATCHES='2';  # 将 Batch Size 拆分为 2 个微批次
 python controller.py
 "@
 

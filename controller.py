@@ -1,19 +1,11 @@
 """
-训练控制器：
-- 从本地文本构造 LM 批次
-- 调度 pre_fn / post_fn / expert_app 等无服务器函数（基于统一实例池 + 函数映射）
-- 并行执行 Micro-Batches（微批次）
-- 在前向阶段插入真正的 MoE 专家前向：
-  pre_fn -> (h, router_logits)
-  controller -> 根据 router_logits 做 top-k、分发到 expert_app:/fwd
-  expert_app -> ExpertMLP 前向
-  controller -> 将专家输出按 gate 加权合并，再送入 post_fn
-- 在反向阶段根据 Hot/Cold 专家集合，区分通信模式：
-  - 热专家优先走 Redis 等 "hot" 通道（低延迟），或退回 http
-  - 冷专家优先走 OSS 等 "cold" 通道（高延迟），或退回 http
-- 指标记录：
-  - train：每 LOG_TRAIN_EVERY 个 step 记录一次“窗口平均”指标
-  - val：每次验证 step 都记录（由 VAL_INTERVAL 控制频率）
+训练控制器 (Final Version)：
+- 架构：并行微批次 (Parallel Micro-batches) + 混合调度 (Heuristic + Online NN)
+- 功能：
+  1. 从本地文本构造 LM 批次
+  2. 异步并发调度 pre/post/expert 实例
+  3. 在线反馈真实 Latency 给调度器进行实时训练
+  4. 记录详细的调度轨迹到 dispatch_trace.jsonl
 """
 
 import os
@@ -21,19 +13,18 @@ import asyncio
 import json
 import time
 import math
-import uuid
 from typing import Any, Dict, List, Tuple, Set
 from collections import defaultdict
 
 import httpx
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 from dataset import LMTextBatcher, DATA_PATH_DEFAULT
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 from nsga2_bw import nsga2_select, feasible_modes
-from scheduler_hybrid import HYBRID_SCHED
-from scheduler_lgbm import record_lgb_training_sample
+from scheduler_hybrid import HYBRID_SCHED  # 核心调度器
 from utils.logger import log
 from utils.metrics import MetricsLogger, StepMetrics
 from comm import CommManager
@@ -57,6 +48,23 @@ MICRO_BATCHES = int(os.getenv("MICRO_BATCHES", "1"))
 
 MOE_CONFIG = None
 TOP_K_DEFAULT = 2
+
+# ----------------- 日志记录工具 -----------------
+
+DISPATCH_LOG_FILE = "dispatch_trace.jsonl"
+
+
+def append_dispatch_log(traces: List[Dict[str, Any]]):
+    """将调度轨迹追加写入 JSONL 文件，供后续分析"""
+    if not traces:
+        return
+    try:
+        with open(DISPATCH_LOG_FILE, "a", encoding="utf-8") as f:
+            for t in traces:
+                f.write(json.dumps(t, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[ERROR] Failed to write dispatch log: {e}")
+
 
 # ----------------- 统一函数实例池 & 函数映射 -----------------
 
@@ -88,7 +96,9 @@ else:
         f"instances.json 格式错误，期望 dict 或 list，实际是 {type(_all_instances_data)}"
     )
 
-INST_BY_ID: Dict[str, Dict[str, Any]] = {inst.get("id"): inst for inst in ALL_INSTANCES}
+INST_BY_ID: Dict[str, Dict[str, Any]] = {
+    inst.get("id"): inst for inst in ALL_INSTANCES
+}
 FUNC_MAP: Dict[str, List[str]] = _load_json(FUNC_MAP_FILE, {})
 
 PRE_STEP_INSTANCE_IDS: Set[str] = set(FUNC_MAP.get("moe.pre_fwd", []))
@@ -113,15 +123,13 @@ TOP_K_DEFAULT = MOE_CONFIG.top_k
 
 
 def get_candidate_instances_for_func(func_name: str) -> List[Dict[str, Any]]:
+    """根据函数名获取所有候选实例对象"""
     ids = FUNC_MAP.get(func_name, [])
     inst_list: List[Dict[str, Any]] = []
     for iid in ids:
         inst = INST_BY_ID.get(iid)
         if inst is not None:
             inst_list.append(inst)
-    if not inst_list:
-        # log("controller", f"[warn] No instances for func={func_name}, ids={ids}")
-        pass
     return inst_list
 
 
@@ -131,26 +139,31 @@ def select_instance_for_func(
     emb_dim: int,
     logical_id: int = 0,
 ) -> Dict[str, Any]:
+    """
+    通用调度入口：调用 HybridScheduler 选择最优实例
+    """
     instances = get_candidate_instances_for_func(func_name)
     if not instances:
         raise RuntimeError(f"No instances configured for func={func_name}")
 
     req = {"tokens": int(tokens), "emb_dim": int(emb_dim)}
     try:
-        chosen, scores = HYBRID_SCHED.select_instances(
+        # 使用混合调度器选择实例（Heuristic + NN）
+        inst, _ = HYBRID_SCHED.select_instance(
             func_type=func_name,
             logical_id=logical_id,
             instances=instances,
             req=req,
-            top_k=1,
         )
-        inst = chosen[0]
     except Exception as e:
+        # 降级策略：直接选列表第一个
+        log("controller", f"Scheduler failed for {func_name}: {e}, using fallback.")
         inst = instances[0]
+
     return inst
 
 
-# ----------------- 前向调用封装 -----------------
+# ----------------- 前向调用封装 (含在线学习反馈) -----------------
 
 
 async def call_pre_fwd(
@@ -161,6 +174,7 @@ async def call_pre_fwd(
     emb_dim: int,
 ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
     func_name = "moe.pre_fwd"
+    # 1. 调度选择
     inst = select_instance_for_func(
         func_name=func_name,
         tokens=tokens,
@@ -175,6 +189,7 @@ async def call_pre_fwd(
         "emb_dim": emb_dim,
     }
 
+    # 2. 执行调用并计时
     t0 = time.perf_counter()
     resp = await client.post(
         url,
@@ -189,16 +204,19 @@ async def call_pre_fwd(
         raise RuntimeError(f"pre_fn HTTP {resp.status_code}: {resp.text[:200]}")
 
     pre_resp = loads(resp.content)
+
+    # 3. [核心] 在线更新 NN 调度器
+    # 将真实的 Latency 反馈给调度器，触发一次 SGD 更新
     try:
-        record_lgb_training_sample(
+        HYBRID_SCHED.update_stats(
             func_type=func_name,
             logical_id=0,
             inst=inst,
             req={"tokens": int(tokens), "emb_dim": int(emb_dim)},
             latency_ms=latency_ms,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log("controller", f"Failed to update NN stats: {e}")
 
     return pre_resp, latency_ms, inst
 
@@ -239,8 +257,9 @@ async def call_post_fwd(
     t1 = time.perf_counter()
     latency_ms = (t1 - t0) * 1000.0
 
+    # 在线更新 NN
     try:
-        record_lgb_training_sample(
+        HYBRID_SCHED.update_stats(
             func_type=func_name,
             logical_id=0,
             inst=inst,
@@ -263,13 +282,17 @@ async def call_expert_fwd_for_eid(
     func_name = f"moe.expert_fwd:{eid}"
     insts = get_candidate_instances_for_func(func_name)
     if not insts:
+        # 无可用实例时直接返回原数据
         return x_e, {}, 0.0
 
+    req = {"tokens": int(x_e.shape[0]), "emb_dim": int(emb_dim)}
+
+    # 调度选择
     inst, _ = HYBRID_SCHED.select_instance(
         func_type=func_name,
         logical_id=eid,
         instances=insts,
-        req={"tokens": int(x_e.shape[0]), "emb_dim": int(emb_dim)},
+        req=req,
     )
     url = inst.get("url", "").rstrip("/") + "/fwd"
 
@@ -291,12 +314,13 @@ async def call_expert_fwd_for_eid(
     obj = loads(resp.content)
     y_e = pack_to_tensor(obj["y"])
 
+    # 在线更新 NN
     try:
-        record_lgb_training_sample(
+        HYBRID_SCHED.update_stats(
             func_type="moe.expert_fwd",
             logical_id=eid,
             inst=inst,
-            req={"tokens": int(x_e.shape[0]), "emb_dim": int(emb_dim)},
+            req=req,
             latency_ms=latency_ms,
         )
     except Exception:
@@ -306,16 +330,11 @@ async def call_expert_fwd_for_eid(
 
 
 def _est_grad_bytes(grad_dict: Dict[str, Any]) -> int:
+    """估算梯度大小，用于计算通信开销特征"""
     total = 0
     dtype_size = {
-        "float32": 4,
-        "float16": 2,
-        "bfloat16": 2,
-        "float64": 8,
-        "int8": 1,
-        "int16": 2,
-        "int32": 4,
-        "int64": 8,
+        "float32": 4, "float16": 2, "bfloat16": 2, "float64": 8,
+        "int8": 1, "int16": 2, "int32": 4, "int64": 8,
     }
     for name, pack in grad_dict.items():
         shape = pack.get("shape", [])
@@ -336,29 +355,36 @@ async def process_micro_batch(
     x_mb: torch.Tensor,
     y_mb: torch.Tensor,
     micro_id: int,
+    micro_batch_index: int,  # 当前是第几个微批次
+    global_step: int,        # 全局步数
     tokens: int,
     train: bool,
 ) -> Dict[str, Any]:
     """
     处理单个微批次的完整流程：Pre -> Expert(s) -> Post -> Grad(Back)
+    返回包含 metrics 和 trace (调度轨迹) 的字典
     """
     metrics = {
-        "loss": 0.0,
-        "acc_top1": 0.0,
-        "acc_top5": 0.0,
-        "pre_lat": 0.0,
-        "post_lat": 0.0,
-        "pre_bwd": 0.0,
-        "post_bwd": 0.0,
-        "expert_comm": 0.0,
-        "grad_bytes": 0,
+        "loss": 0.0, "acc_top1": 0.0, "acc_top5": 0.0,
+        "pre_lat": 0.0, "post_lat": 0.0,
+        "pre_bwd": 0.0, "post_bwd": 0.0,
+        "expert_comm": 0.0, "grad_bytes": 0,
         "dispatch_count": 0,
-        "hot_experts": set(),
-        "cold_experts": set(),
-        "cold_total": 0,
-        "cold_skipped": 0,
+        "hot_experts": set(), "cold_experts": set(),
+        "cold_total": 0, "cold_skipped": 0,
         "mode_counts": defaultdict(int),
         "inst_choice_counts": defaultdict(int),
+    }
+
+    # 调度轨迹结构，用于 jsonl 日志
+    trace = {
+        "step": global_step,
+        "mb_idx": micro_batch_index,
+        "ts": time.time(),
+        "pre": None,
+        "experts_fwd": [],
+        "post": None,
+        "experts_bwd": [],
     }
 
     # ---------- 1. pre_fn / fwd ----------
@@ -370,6 +396,7 @@ async def process_micro_batch(
         emb_dim=0,
     )
     metrics["pre_lat"] += pre_lat_ms
+    trace["pre"] = pre_inst.get("id")
 
     hidden_pack = pre_resp["hidden"]
     gate_pack = pre_resp["gate"]
@@ -419,6 +446,9 @@ async def process_micro_batch(
         for i, (y_e, inst_e, lat_ms) in enumerate(expert_results):
             eid, items = expert_eids[i]
             metrics["expert_comm"] += lat_ms
+            inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
+
+            trace["experts_fwd"].append({"eid": eid, "inst": inst_id, "lat": lat_ms})
 
             # 结果聚合
             cnt = 0
@@ -428,7 +458,6 @@ async def process_micro_batch(
 
             if inst_e:
                 metrics["dispatch_count"] += 1
-                inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
                 metrics["inst_choice_counts"][inst_id] += 1
     else:
         merged_h = h
@@ -450,6 +479,7 @@ async def process_micro_batch(
     metrics["loss"] = float(post_resp["loss"])
     metrics["acc_top1"] = float(post_resp.get("acc_top1", 0.0))
     metrics["acc_top5"] = float(post_resp.get("acc_top5", 0.0))
+    trace["post"] = post_inst.get("id")
 
     # ---------- 5. Backward Path (Train Only) ----------
     if train:
@@ -488,18 +518,19 @@ async def process_micro_batch(
 
                 for eid_str, g_data in grads_map.items():
                     eid_int = int(eid_str)
-                    inst_list = get_candidate_instances_for_func(
-                        f"moe.expert_apply_grad:{eid_str}"
-                    )
+                    func_grad_name = f"moe.expert_apply_grad:{eid_str}"
+                    inst_list = get_candidate_instances_for_func(func_grad_name)
                     if not inst_list:
                         continue
 
+                    # 冷专家降频更新策略
                     if eid_int in step_cold:
                         metrics["cold_total"] += 1
                         if (micro_id % COLD_ACC_STEPS) != 0:
                             metrics["cold_skipped"] += 1
                             continue
 
+                    # 通信模式选择
                     all_modes = feasible_modes()
                     if eid_int in step_hot:
                         cand_modes = [m for m in all_modes if m in ("hot", "http")]
@@ -511,14 +542,18 @@ async def process_micro_batch(
                     if not cand_modes:
                         continue
 
-                    req = {"grad_bytes": grad_bytes, "price_cents_s": DEFAULT_PRICE_CENTS_S}
+                    # NSGA-II 选实例和模式
+                    req = {
+                        "grad_bytes": grad_bytes,
+                        "price_cents_s": DEFAULT_PRICE_CENTS_S,
+                    }
                     choice = nsga2_select(
                         inst_list,
                         req,
                         deadline_ms=STEP_PERIOD_MS,
                         pop_size=8,
                         generations=3,
-                        seed=42 + micro_id,  # 确保不同微批次随机种子不同
+                        seed=42 + micro_id, # 确保并行时种子不同
                         modes=cand_modes,
                     )
 
@@ -528,7 +563,6 @@ async def process_micro_batch(
 
                         t_comm0 = time.perf_counter()
                         if mode == "hot":
-                            # 注意：请确保 comm.py 中 send_hot 使用了唯一文件名避免并发冲突
                             comm_manager.send_hot(eid_str, {eid_str: g_data})
                         elif mode == "cold":
                             comm_manager.send_cold(eid_str, {eid_str: g_data})
@@ -539,13 +573,33 @@ async def process_micro_batch(
                                 headers={"Content-Type": "application/msgpack"},
                             )
 
-                        metrics["expert_comm"] += (time.perf_counter() - t_comm0) * 1000.0
+                        comm_lat = (time.perf_counter() - t_comm0) * 1000.0
+                        metrics["expert_comm"] += comm_lat
                         metrics["dispatch_count"] += 1
                         metrics["mode_counts"][mode] += 1
                         inst_id = inst.get("id") or inst.get("url")
                         metrics["inst_choice_counts"][inst_id] += 1
 
-    return metrics
+                        trace["experts_bwd"].append({
+                            "eid": eid_int,
+                            "inst": inst_id,
+                            "mode": mode,
+                            "lat": comm_lat
+                        })
+
+                        # [关键] 更新 NN：把通信时间也作为该实例处理 apply_grad 的性能指标
+                        try:
+                            HYBRID_SCHED.update_stats(
+                                func_type=func_grad_name,
+                                logical_id=eid_int,
+                                inst=inst,
+                                req=req,
+                                latency_ms=comm_lat,
+                            )
+                        except Exception:
+                            pass
+
+    return {"metrics": metrics, "trace": trace}
 
 
 # ----------------- 聚合微批次并执行 Step -----------------
@@ -562,7 +616,6 @@ async def run_step(
 
     # 1. 获取 Batch
     x, y = batcher.next_batch()
-    assert x.shape == (BATCH_SIZE, BLOCK_SIZE)
 
     micro_batches = MICRO_BATCHES
     micro_bs = BATCH_SIZE // micro_batches
@@ -583,16 +636,25 @@ async def run_step(
                     comm_manager=COMM,
                     x_mb=x_mb,
                     y_mb=y_mb,
-                    micro_id=global_step,  # 也可以传 global_step * micro_batches + m
+                    micro_id=global_step * micro_batches + m, # 唯一标识
+                    micro_batch_index=m,
+                    global_step=global_step,
                     tokens=tokens,
                     train=train,
                 )
             )
 
-        # 核心并发点
-        results = await asyncio.gather(*tasks)
+        # 核心并发点: 等待所有微批次完成
+        results_wrapper = await asyncio.gather(*tasks)
 
-    # 3. 聚合指标
+    # 3. 结果分离 & 记录 Trace
+    results = [r["metrics"] for r in results_wrapper]
+    traces = [r["trace"] for r in results_wrapper]
+
+    if train:
+        append_dispatch_log(traces)
+
+    # 4. 聚合指标 (求平均或求和)
     agg_loss = sum(r["loss"] for r in results)
     agg_top1 = sum(r["acc_top1"] for r in results)
     agg_top5 = sum(r["acc_top5"] for r in results)
@@ -624,7 +686,7 @@ async def run_step(
     t_step1 = time.perf_counter()
     step_time_ms = (t_step1 - t_step0) * 1000.0
 
-    # 4. 计算论文指标
+    # 5. 计算统计指标
     if hot_experts_step or cold_experts_step:
         denom = len(hot_experts_step) + len(cold_experts_step)
         hot_ratio = len(hot_experts_step) / denom
@@ -648,7 +710,7 @@ async def run_step(
     else:
         inst_entropy = 0.0
 
-    # 5. 指标记录
+    # 6. 记录 Step 指标
     step_metrics = StepMetrics(
         step=global_step,
         phase=phase,
@@ -663,7 +725,7 @@ async def run_step(
         post_bwd_ms=post_bwd_all / micro_batches,
         pre_bwd_ms=pre_bwd_all / micro_batches,
         step_time_ms=step_time_ms,
-        expert_comm_ms=expert_comm_ms,  # 累计时间，反映总通信开销
+        expert_comm_ms=expert_comm_ms,
         grad_bytes=grad_bytes,
         expert_inst_cnt=expert_inst_cnt,
         dispatch_count=dispatch_count,
@@ -678,19 +740,26 @@ async def run_step(
     global _train_acc, _train_count
 
     if phase == "train":
-        # 共享参数更新 (Step) - 放在所有微批次完成后统一执行
+        # 参数更新 (Step)
+        # 注意：这里我们模拟“所有微批次完成后，统一进行一次参数更新”
         async with httpx.AsyncClient() as client_step:
             for iid in PRE_STEP_INSTANCE_IDS:
                 inst = INST_BY_ID.get(iid)
                 if inst:
-                    await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+                    try:
+                        await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+                    except Exception:
+                        pass
             for iid in POST_STEP_INSTANCE_IDS:
                 inst = INST_BY_ID.get(iid)
                 if inst:
-                    await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+                    try:
+                        await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+                    except Exception:
+                        pass
 
+        # 累积窗口平均值
         _train_count += 1
-        # 累积指标...
         _train_acc["loss"] += step_metrics.loss
         _train_acc["acc_top1"] += step_metrics.acc_top1
         _train_acc["acc_top5"] += step_metrics.acc_top5
@@ -741,7 +810,7 @@ async def run_step(
             return
         return
 
-    # val phase
+    # val 阶段
     metrics_logger.log(step_metrics)
 
 
@@ -750,6 +819,14 @@ async def run_step(
 
 async def main() -> None:
     log("controller", "Starting training controller")
+
+    # 清空旧的调度日志
+    if os.path.exists(DISPATCH_LOG_FILE):
+        try:
+            os.remove(DISPATCH_LOG_FILE)
+            log("controller", f"Removed old dispatch log: {DISPATCH_LOG_FILE}")
+        except:
+            pass
 
     train_batcher = LMTextBatcher(
         data_path=DATA_PATH,
