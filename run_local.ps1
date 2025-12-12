@@ -151,9 +151,9 @@ uvicorn expert_app:app --host 127.0.0.1 --port 8213
 
 Start-Window -command @"
 `$env:TOP_K='2'; `$env:NUM_EXPERTS='2';  # 这里配置为 2 个逻辑专家：0 和 1
-`$env:BATCH_SIZE='4'; `$env:BLOCK_SIZE='64';
-`$env:MAX_STEPS='4200'; `$env:VAL_INTERVAL='50'; `$env:LOG_TRAIN_EVERY='100';
-`$env:MICRO_BATCHES='2';  # 将 Batch Size 拆分为 2 个微批次
+`$env:BATCH_SIZE='32'; `$env:BLOCK_SIZE='64';
+`$env:MAX_STEPS='500'; `$env:VAL_INTERVAL='100'; `$env:LOG_TRAIN_EVERY='10';
+`$env:MICRO_BATCHES='4';  # 将 Batch Size 拆分为 2 个微批次
 python controller.py
 "@
 
