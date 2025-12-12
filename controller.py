@@ -844,7 +844,7 @@ async def main() -> None:
     metrics_logger = MetricsLogger("metrics.csv")
 
     global_step = 0
-    max_steps = int(os.getenv("MAX_STEPS", "1000"))
+    max_steps = int(os.getenv("MAX_STEPS", "4200"))
 
     while global_step < max_steps:
         phase = "train"
