@@ -2,6 +2,7 @@
 训练控制器：
 - 从本地文本构造 LM 批次
 - 调度 pre_fn / post_fn / expert_app 等无服务器函数（基于统一实例池 + 函数映射）
+- 并行执行 Micro-Batches（微批次）
 - 在前向阶段插入真正的 MoE 专家前向：
   pre_fn -> (h, router_logits)
   controller -> 根据 router_logits 做 top-k、分发到 expert_app:/fwd
@@ -20,11 +21,12 @@ import asyncio
 import json
 import time
 import math
+import uuid
 from typing import Any, Dict, List, Tuple, Set
 from collections import defaultdict
 
 import httpx
-import torch  # 主要用于 dataset / shared 中的张量处理
+import torch
 import torch.nn.functional as F
 
 from dataset import LMTextBatcher, DATA_PATH_DEFAULT
@@ -53,8 +55,7 @@ DEFAULT_PRICE_CENTS_S = float(os.getenv("DEFAULT_PRICE_CENTS_S", "0.0"))
 
 MICRO_BATCHES = int(os.getenv("MICRO_BATCHES", "1"))
 
-# MoE 路由超参（用于 controller 端的 expert fwd）
-MOE_CONFIG = None  # 稍后在加载完函数映射后初始化
+MOE_CONFIG = None
 TOP_K_DEFAULT = 2
 
 # ----------------- 统一函数实例池 & 函数映射 -----------------
@@ -77,12 +78,7 @@ def _load_json(path: str, default: Any) -> Any:
         return default
 
 
-# 实例池：平台视角，只知道 runtime/mem/cpu/依赖/价格 等
 _all_instances_data = _load_json(INSTANCES_FILE, [])
-
-# 兼容两种格式：
-#   1) {"instances": [ ... ]}
-#   2) [ ... ]
 if isinstance(_all_instances_data, dict):
     ALL_INSTANCES: List[Dict[str, Any]] = _all_instances_data.get("instances", [])
 elif isinstance(_all_instances_data, list):
@@ -93,11 +89,8 @@ else:
     )
 
 INST_BY_ID: Dict[str, Dict[str, Any]] = {inst.get("id"): inst for inst in ALL_INSTANCES}
-
-# 函数映射：应用视角，知道“moe.pre_fwd”可以在哪些实例上执行
 FUNC_MAP: Dict[str, List[str]] = _load_json(FUNC_MAP_FILE, {})
 
-# 预先统计：哪些实例参与 pre/post/expert_apply_grad，用于 /step 和指标
 PRE_STEP_INSTANCE_IDS: Set[str] = set(FUNC_MAP.get("moe.pre_fwd", []))
 POST_STEP_INSTANCE_IDS: Set[str] = set(FUNC_MAP.get("moe.post_fwd", []))
 
@@ -110,14 +103,7 @@ for fn_name, ids in FUNC_MAP.items():
 
 log("controller", f"Loaded {len(ALL_INSTANCES)} instances from {INSTANCES_FILE}")
 log("controller", f"Loaded {len(FUNC_MAP)} function mappings from {FUNC_MAP_FILE}")
-log(
-    "controller",
-    f"PRE_STEP_INSTANCES={len(PRE_STEP_INSTANCE_IDS)}, "
-    f"POST_STEP_INSTANCES={len(POST_STEP_INSTANCE_IDS)}, "
-    f"EXPERT_INSTANCES={len(EXPERT_INSTANCE_IDS)}",
-)
 
-# 初始化 MoE 配置（优先读取 moe_config 中的默认值，再结合 experts 映射）
 MOE_CONFIG = load_moe_config(
     {k: v for k, v in FUNC_MAP.items() if k.startswith("moe.expert_fwd:")}
 )
@@ -127,18 +113,15 @@ TOP_K_DEFAULT = MOE_CONFIG.top_k
 
 
 def get_candidate_instances_for_func(func_name: str) -> List[Dict[str, Any]]:
-    """
-    根据函数逻辑名（如 'moe.pre_fwd', 'moe.post_fwd', 'moe.expert_fwd:0'）从统一实例池中取出候选实例列表。
-    """
     ids = FUNC_MAP.get(func_name, [])
     inst_list: List[Dict[str, Any]] = []
     for iid in ids:
         inst = INST_BY_ID.get(iid)
         if inst is not None:
             inst_list.append(inst)
-
     if not inst_list:
-        log("controller", f"[warn] No instances for func={func_name}, ids={ids}")
+        # log("controller", f"[warn] No instances for func={func_name}, ids={ids}")
+        pass
     return inst_list
 
 
@@ -148,15 +131,11 @@ def select_instance_for_func(
     emb_dim: int,
     logical_id: int = 0,
 ) -> Dict[str, Any]:
-    """
-    使用 HYBRID_SCHED（LightGBM + NN）在候选实例中选出 cost 最低的实例。
-    """
     instances = get_candidate_instances_for_func(func_name)
     if not instances:
         raise RuntimeError(f"No instances configured for func={func_name}")
 
     req = {"tokens": int(tokens), "emb_dim": int(emb_dim)}
-
     try:
         chosen, scores = HYBRID_SCHED.select_instances(
             func_type=func_name,
@@ -167,13 +146,7 @@ def select_instance_for_func(
         )
         inst = chosen[0]
     except Exception as e:
-        log(
-            "controller",
-            f"HYBRID_SCHED.select_instances failed for func={func_name}: {e}, "
-            f"fallback to first candidate instance",
-        )
         inst = instances[0]
-
     return inst
 
 
@@ -187,11 +160,6 @@ async def call_pre_fwd(
     tokens: int,
     emb_dim: int,
 ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
-    """
-    调用 pre_fn /fwd：
-      - 通过调度器从 func_map.json + instances.json 中为 'moe.pre_fwd' 选择实例
-      - 向该实例的 /fwd 发送 msgpack 请求
-    """
     func_name = "moe.pre_fwd"
     inst = select_instance_for_func(
         func_name=func_name,
@@ -200,7 +168,6 @@ async def call_pre_fwd(
         logical_id=0,
     )
     url = inst.get("url", "").rstrip("/") + "/fwd"
-
     payload = {
         "x": x_ids_pack,
         "micro_id": micro_id,
@@ -208,11 +175,10 @@ async def call_pre_fwd(
         "emb_dim": emb_dim,
     }
 
-    req_bytes = dumps(payload)
     t0 = time.perf_counter()
     resp = await client.post(
         url,
-        content=req_bytes,
+        content=dumps(payload),
         headers={"Content-Type": "application/msgpack"},
         timeout=30.0,
     )
@@ -220,22 +186,9 @@ async def call_pre_fwd(
     latency_ms = (t1 - t0) * 1000.0
 
     if resp.status_code != 200:
-        print(
-            "[controller] pre_fn HTTP error:",
-            resp.status_code,
-            "text:",
-            resp.text[:200],
-        )
-        raise RuntimeError(f"pre_fn HTTP {resp.status_code}")
+        raise RuntimeError(f"pre_fn HTTP {resp.status_code}: {resp.text[:200]}")
 
-    try:
-        pre_resp = loads(resp.content)
-    except Exception as e:
-        print("[controller] pre_fn decode error:", repr(e))
-        print("[controller] raw response bytes[:200] =", resp.content[:200])
-        raise
-
-    # LightGBM 在线样本：pre
+    pre_resp = loads(resp.content)
     try:
         record_lgb_training_sample(
             func_type=func_name,
@@ -244,8 +197,8 @@ async def call_pre_fwd(
             req={"tokens": int(tokens), "emb_dim": int(emb_dim)},
             latency_ms=latency_ms,
         )
-    except Exception as e:
-        log("controller", f"[warn] record_lgb_training_sample(pre) failed: {e}")
+    except Exception:
+        pass
 
     return pre_resp, latency_ms, inst
 
@@ -259,9 +212,6 @@ async def call_post_fwd(
     emb_dim: int,
     train: bool,
 ) -> Tuple[Dict[str, Any], float, Dict[str, Any]]:
-    """
-    调用 post_fn 前向，并在结束后记录一条 LightGBM 在线训练样本。
-    """
     func_name = "moe.post_fwd"
     inst = select_instance_for_func(
         func_name=func_name,
@@ -270,7 +220,6 @@ async def call_post_fwd(
         logical_id=0,
     )
     url = inst.get("url", "").rstrip("/") + "/fwd"
-    req_features = {"tokens": int(tokens), "emb_dim": int(emb_dim)}
 
     t0 = time.perf_counter()
     resp = await client.post(
@@ -290,17 +239,16 @@ async def call_post_fwd(
     t1 = time.perf_counter()
     latency_ms = (t1 - t0) * 1000.0
 
-    # LightGBM 在线训练样本（post）
     try:
         record_lgb_training_sample(
             func_type=func_name,
             logical_id=0,
             inst=inst,
-            req=req_features,
+            req={"tokens": int(tokens), "emb_dim": int(emb_dim)},
             latency_ms=latency_ms,
         )
-    except Exception as e:
-        log("controller", f"[warn] record_lgb_training_sample({func_name}) failed: {e}")
+    except Exception:
+        pass
 
     data = loads(resp.content)
     return data, latency_ms, inst
@@ -312,17 +260,9 @@ async def call_expert_fwd_for_eid(
     x_e: torch.Tensor,
     emb_dim: int,
 ) -> Tuple[torch.Tensor, Dict[str, Any], float]:
-    """
-    对某个逻辑专家 eid 执行一次前向：
-      - 通过 func_name = f"moe.expert_fwd:{eid}" 从 FUNC_MAP 取候选实例
-      - 使用 HYBRID_SCHED 选择实例
-      - 调用 /fwd
-    """
     func_name = f"moe.expert_fwd:{eid}"
     insts = get_candidate_instances_for_func(func_name)
     if not insts:
-        # 没有配置时，直接返回原输入，表示不经过专家变换
-        log("controller", f"[expert_fwd] no instances for {func_name}, skip")
         return x_e, {}, 0.0
 
     inst, _ = HYBRID_SCHED.select_instance(
@@ -349,9 +289,8 @@ async def call_expert_fwd_for_eid(
         )
 
     obj = loads(resp.content)
-    y_e = pack_to_tensor(obj["y"])  # (N,D)
+    y_e = pack_to_tensor(obj["y"])
 
-    # LightGBM 在线训练样本（expert fwd）
     try:
         record_lgb_training_sample(
             func_type="moe.expert_fwd",
@@ -360,21 +299,13 @@ async def call_expert_fwd_for_eid(
             req={"tokens": int(x_e.shape[0]), "emb_dim": int(emb_dim)},
             latency_ms=latency_ms,
         )
-    except Exception as e:
-        log("controller", f"[warn] record_lgb_training_sample(expert_fwd) failed: {e}")
+    except Exception:
+        pass
 
     return y_e, inst, latency_ms
 
 
-# ----------------- 工具：估算梯度大小 -----------------
-
-
 def _est_grad_bytes(grad_dict: Dict[str, Any]) -> int:
-    """
-    根据 packed tensor 估算梯度总字节大小。
-    格式约定同 shared.tensor_to_pack：
-    - {'shape': [...], 'dtype': 'float32', 'data': b'...'}
-    """
     total = 0
     dtype_size = {
         "float32": 4,
@@ -396,7 +327,228 @@ def _est_grad_bytes(grad_dict: Dict[str, Any]) -> int:
     return total
 
 
-# ----------------- 单个 step 的完整前向 + 反向 + 通信 -----------------
+# ----------------- 单个微批次处理逻辑 (并行化核心) -----------------
+
+
+async def process_micro_batch(
+    client: httpx.AsyncClient,
+    comm_manager: CommManager,
+    x_mb: torch.Tensor,
+    y_mb: torch.Tensor,
+    micro_id: int,
+    tokens: int,
+    train: bool,
+) -> Dict[str, Any]:
+    """
+    处理单个微批次的完整流程：Pre -> Expert(s) -> Post -> Grad(Back)
+    """
+    metrics = {
+        "loss": 0.0,
+        "acc_top1": 0.0,
+        "acc_top5": 0.0,
+        "pre_lat": 0.0,
+        "post_lat": 0.0,
+        "pre_bwd": 0.0,
+        "post_bwd": 0.0,
+        "expert_comm": 0.0,
+        "grad_bytes": 0,
+        "dispatch_count": 0,
+        "hot_experts": set(),
+        "cold_experts": set(),
+        "cold_total": 0,
+        "cold_skipped": 0,
+        "mode_counts": defaultdict(int),
+        "inst_choice_counts": defaultdict(int),
+    }
+
+    # ---------- 1. pre_fn / fwd ----------
+    pre_resp, pre_lat_ms, pre_inst = await call_pre_fwd(
+        client=client,
+        x_ids_pack=tensor_to_pack(x_mb),
+        micro_id=micro_id,
+        tokens=tokens,
+        emb_dim=0,
+    )
+    metrics["pre_lat"] += pre_lat_ms
+
+    hidden_pack = pre_resp["hidden"]
+    gate_pack = pre_resp["gate"]
+    if "hot" in pre_resp:
+        metrics["hot_experts"].update(pre_resp["hot"])
+        metrics["cold_experts"].update(pre_resp.get("cold", []))
+
+    # ---------- 2. Controller Router Logic ----------
+    h = pack_to_tensor(hidden_pack).float()
+    router_logits = pack_to_tensor(gate_pack).float()
+
+    B_mb, T, D = h.shape
+    num_experts = router_logits.shape[-1]
+    top_k = max(1, min(TOP_K_DEFAULT, num_experts))
+
+    topk_vals, topk_idx = torch.topk(router_logits, k=top_k, dim=-1)
+    gates = F.softmax(topk_vals, dim=-1)
+
+    expert_to_tokens = {}
+    topk_idx_np = topk_idx.cpu().numpy()
+    gates_np = gates.cpu().numpy()
+
+    for b in range(B_mb):
+        for t in range(T):
+            for k_id in range(top_k):
+                eid = int(topk_idx_np[b, t, k_id])
+                gw = float(gates_np[b, t, k_id])
+                expert_to_tokens.setdefault(eid, []).append((b, t, k_id, gw))
+
+    merged_h = torch.zeros_like(h)
+
+    # ---------- 3. Parallel Expert Forward ----------
+    expert_tasks = []
+    expert_eids = []
+
+    for eid, items in expert_to_tokens.items():
+        idx_b = [b for (b, t, k_id, gw) in items]
+        idx_t = [t for (b, t, k_id, gw) in items]
+        x_e = h[idx_b, idx_t, :]
+        expert_eids.append((eid, items))
+        expert_tasks.append(call_expert_fwd_for_eid(client, eid, x_e, D))
+
+    if expert_tasks:
+        # 并发请求所有专家
+        expert_results = await asyncio.gather(*expert_tasks)
+
+        for i, (y_e, inst_e, lat_ms) in enumerate(expert_results):
+            eid, items = expert_eids[i]
+            metrics["expert_comm"] += lat_ms
+
+            # 结果聚合
+            cnt = 0
+            for b, t, k_id, gw in items:
+                merged_h[b, t, :] += gw * y_e[cnt]
+                cnt += 1
+
+            if inst_e:
+                metrics["dispatch_count"] += 1
+                inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
+                metrics["inst_choice_counts"][inst_id] += 1
+    else:
+        merged_h = h
+
+    # ---------- 4. post_fn / fwd ----------
+    hidden_after_expert_pack = tensor_to_pack(merged_h.cpu())
+    targets_pack = tensor_to_pack(y_mb)
+
+    post_resp, post_lat_ms, post_inst = await call_post_fwd(
+        client=client,
+        y_pack=hidden_after_expert_pack,
+        targets_pack=targets_pack,
+        micro_id=micro_id,
+        tokens=tokens,
+        emb_dim=0,
+        train=train,
+    )
+    metrics["post_lat"] += post_lat_ms
+    metrics["loss"] = float(post_resp["loss"])
+    metrics["acc_top1"] = float(post_resp.get("acc_top1", 0.0))
+    metrics["acc_top5"] = float(post_resp.get("acc_top5", 0.0))
+
+    # ---------- 5. Backward Path (Train Only) ----------
+    if train:
+        # post_fn bwd
+        t0 = time.perf_counter()
+        grads_pack = post_resp["grads"]
+        resp = await client.post(
+            post_inst.get("url", "").rstrip("/") + "/bwd",
+            content=dumps({"grads": grads_pack, "micro_id": micro_id}),
+            headers={"Content-Type": "application/msgpack"},
+        )
+        metrics["post_bwd"] += (time.perf_counter() - t0) * 1000.0
+
+        rb = loads(resp.content)
+        pre_grads = rb.get("pre_grads")
+
+        # pre_fn bwd
+        if pre_grads is not None:
+            t0 = time.perf_counter()
+            await client.post(
+                pre_inst.get("url", "").rstrip("/") + "/bwd",
+                content=dumps({"grads": pre_grads, "micro_id": micro_id}),
+                headers={"Content-Type": "application/msgpack"},
+            )
+            metrics["pre_bwd"] += (time.perf_counter() - t0) * 1000.0
+
+        # Expert Grads Communication (NSGA-II)
+        if USE_NSGA2 and "expert_grads" in rb:
+            grads_map = rb["expert_grads"]
+            if grads_map:
+                grad_bytes = _est_grad_bytes(grads_map)
+                metrics["grad_bytes"] += grad_bytes
+
+                step_hot = metrics["hot_experts"]
+                step_cold = metrics["cold_experts"]
+
+                for eid_str, g_data in grads_map.items():
+                    eid_int = int(eid_str)
+                    inst_list = get_candidate_instances_for_func(
+                        f"moe.expert_apply_grad:{eid_str}"
+                    )
+                    if not inst_list:
+                        continue
+
+                    if eid_int in step_cold:
+                        metrics["cold_total"] += 1
+                        if (micro_id % COLD_ACC_STEPS) != 0:
+                            metrics["cold_skipped"] += 1
+                            continue
+
+                    all_modes = feasible_modes()
+                    if eid_int in step_hot:
+                        cand_modes = [m for m in all_modes if m in ("hot", "http")]
+                    elif eid_int in step_cold:
+                        cand_modes = [m for m in all_modes if m in ("cold", "http")]
+                    else:
+                        cand_modes = list(all_modes)
+
+                    if not cand_modes:
+                        continue
+
+                    req = {"grad_bytes": grad_bytes, "price_cents_s": DEFAULT_PRICE_CENTS_S}
+                    choice = nsga2_select(
+                        inst_list,
+                        req,
+                        deadline_ms=STEP_PERIOD_MS,
+                        pop_size=8,
+                        generations=3,
+                        seed=42 + micro_id,  # 确保不同微批次随机种子不同
+                        modes=cand_modes,
+                    )
+
+                    if choice:
+                        inst, mode = choice
+                        url = inst.get("url", "").rstrip("/")
+
+                        t_comm0 = time.perf_counter()
+                        if mode == "hot":
+                            # 注意：请确保 comm.py 中 send_hot 使用了唯一文件名避免并发冲突
+                            comm_manager.send_hot(eid_str, {eid_str: g_data})
+                        elif mode == "cold":
+                            comm_manager.send_cold(eid_str, {eid_str: g_data})
+                        else:
+                            await client.post(
+                                url + "/grad/apply",
+                                content=dumps({"grads": {eid_str: g_data}}),
+                                headers={"Content-Type": "application/msgpack"},
+                            )
+
+                        metrics["expert_comm"] += (time.perf_counter() - t_comm0) * 1000.0
+                        metrics["dispatch_count"] += 1
+                        metrics["mode_counts"][mode] += 1
+                        inst_id = inst.get("id") or inst.get("url")
+                        metrics["inst_choice_counts"][inst_id] += 1
+
+    return metrics
+
+
+# ----------------- 聚合微批次并执行 Step -----------------
 
 
 async def run_step(
@@ -408,383 +560,71 @@ async def run_step(
     train = phase == "train"
     tokens = BATCH_SIZE * BLOCK_SIZE
 
-    # 从数据集中取一个 batch
+    # 1. 获取 Batch
     x, y = batcher.next_batch()
     assert x.shape == (BATCH_SIZE, BLOCK_SIZE)
-    assert y.shape == (BATCH_SIZE, BLOCK_SIZE)
 
-    x_ids = x
-    target_ids = y
-
-    # 微批次拆分
     micro_batches = MICRO_BATCHES
     micro_bs = BATCH_SIZE // micro_batches
 
     COMM = CommManager()
-
     t_step0 = time.perf_counter()
 
-    # 调度/通信行为统计（论文指标）
-
-    hot_experts_step = set()
-    cold_experts_step = set()
-    cold_total = 0
-    cold_skipped = 0
-    mode_counts = {"hot": 0, "cold": 0, "http": 0}
-    inst_choice_counts = defaultdict(int)
-    dispatch_count = 0  # 本 step 实际触发的 expert dispatch 次数
-
     async with httpx.AsyncClient() as client:
-        agg_loss = 0.0
-        agg_top1 = 0.0
-        agg_top5 = 0.0
-
-        pre_lat_all = 0.0
-        post_lat_all = 0.0
-        post_bwd_all = 0.0
-        pre_bwd_all = 0.0
-        expert_comm_ms = 0.0
-        grad_bytes = 0
-        expert_inst_cnt = len(EXPERT_INSTANCE_IDS)
-
-        async def run_microbatch(m: int, x_mb: torch.Tensor, y_mb: torch.Tensor) -> Dict[str, Any]:
-            micro_result: Dict[str, Any] = {
-                "loss": 0.0,
-                "acc_top1": 0.0,
-                "acc_top5": 0.0,
-                "pre_lat_ms": 0.0,
-                "post_lat_ms": 0.0,
-                "post_bwd_ms": 0.0,
-                "pre_bwd_ms": 0.0,
-                "expert_comm_ms": 0.0,
-                "grad_bytes": 0,
-                "dispatch_count": 0,
-                "inst_choice_counts": defaultdict(int),
-                "mode_counts": {"hot": 0, "cold": 0, "http": 0},
-                "hot_experts": set(),
-                "cold_experts": set(),
-                "cold_total": 0,
-                "cold_skipped": 0,
-            }
-
-            # ---------- pre_fn / fwd ----------
-            pre_resp, pre_lat_ms, pre_inst = await call_pre_fwd(
-                client=client,
-                x_ids_pack=tensor_to_pack(x_mb),
-                micro_id=global_step,
-                tokens=tokens,
-                emb_dim=0,  # 这里暂时不用 emb_dim，可根据模型实际扩展
-            )
-            micro_result["pre_lat_ms"] = pre_lat_ms
-
-            hidden_pack = pre_resp["hidden"]
-            gate_pack = pre_resp["gate"]  # router logits
-            route_info = pre_resp.get("route", None)
-
-            # 记录热/冷专家（根据 pre_fn 的统计）
-            if "hot" in pre_resp:
-                hot_experts_micro = set(pre_resp["hot"])
-                cold_experts_micro = set(pre_resp.get("cold", []))
-                micro_result["hot_experts"].update(hot_experts_micro)
-                micro_result["cold_experts"].update(cold_experts_micro)
-
-            h = pack_to_tensor(hidden_pack).float()  # (B_mb, T, D)
-            router_logits = pack_to_tensor(gate_pack).float()  # (B_mb, T, E)
-
-            B_mb, T, D = h.shape
-            num_experts = router_logits.shape[-1]
-            top_k = max(1, min(TOP_K_DEFAULT, num_experts))
-
-            topk_vals, topk_idx = torch.topk(router_logits, k=top_k, dim=-1)  # (B,T,K)
-            gates = F.softmax(topk_vals, dim=-1)  # (B,T,K)
-
-            expert_to_tokens: Dict[int, List[Tuple[int, int, int, float]]] = {}
-            topk_idx_np = topk_idx.cpu().numpy()
-            gates_np = gates.cpu().numpy()
-
-            for b in range(B_mb):
-                for t in range(T):
-                    for k_id in range(top_k):
-                        eid = int(topk_idx_np[b, t, k_id])
-                        gw = float(gates_np[b, t, k_id])
-                        expert_to_tokens.setdefault(eid, []).append((b, t, k_id, gw))
-
-            merged_h = torch.zeros_like(h)
-
-            for eid, items in expert_to_tokens.items():
-
-                idx_b = [b for (b, t, k_id, gw) in items]
-                idx_t = [t for (b, t, k_id, gw) in items]
-                x_e = h[idx_b, idx_t, :]  # (N, D)
-
-                y_e, inst_e, lat_ms = await call_expert_fwd_for_eid(
-                    client=client,
-                    eid=eid,
-                    x_e=x_e,
-                    emb_dim=D,
-                )
-                micro_result["expert_comm_ms"] += lat_ms
-
-                # 将专家输出按 gate 写回 merged_h
-                i = 0
-                for (b, t, k_id, gw) in items:
-                    merged_h[b, t, :] += gw * y_e[i]
-                    i += 1
-
-                if inst_e:
-                    micro_result["dispatch_count"] += 1
-                    inst_id = inst_e.get("id") or inst_e.get("url") or str(inst_e)
-                    micro_result["inst_choice_counts"][inst_id] += 1
-
-            # 如果没有任何 expert 实例可用，就退回原始 h
-            if not expert_to_tokens:
-                merged_h = h
-
-            # 将专家后的 hidden 打包，送给 post_fn
-            hidden_after_expert_pack = tensor_to_pack(merged_h.cpu())
-
-            # ---------- post_fn / fwd ----------
-            targets_pack = tensor_to_pack(y_mb)
-            post_resp, post_lat_ms, post_inst = await call_post_fwd(
-                client=client,
-                y_pack=hidden_after_expert_pack,
-                targets_pack=targets_pack,
-                micro_id=global_step,
-                tokens=tokens,
-                emb_dim=0,
-                train=train,
-            )
-            micro_result["post_lat_ms"] = post_lat_ms
-
-            micro_result["loss"] = float(post_resp["loss"])
-            micro_result["acc_top1"] = float(post_resp.get("acc_top1", 0.0))
-            micro_result["acc_top5"] = float(post_resp.get("acc_top5", 0.0))
-
-
-            if train:
-                t0 = time.perf_counter()
-                grads_pack = post_resp["grads"]
-                resp = await client.post(
-                    post_inst.get("url", "").rstrip("/") + "/bwd",
-                    content=dumps(
-                        {
-                            "grads": grads_pack,
-                            "micro_id": global_step,
-                        }
-                    ),
-                    headers={"Content-Type": "application/msgpack"},
-                )
-                t1 = time.perf_counter()
-                micro_result["post_bwd_ms"] = (t1 - t0) * 1000.0
-
-                rb = loads(resp.content)
-                # 这里假设 rb 里包含 pre_grads / expert_grads 等
-                pre_grads = rb.get("pre_grads")
-
-                if pre_grads is not None:
-                    t0 = time.perf_counter()
-                    await client.post(
-                        pre_inst.get("url", "").rstrip("/") + "/bwd",
-                        content=dumps(
-                            {
-                                "grads": pre_grads,
-                                "micro_id": global_step,
-                            }
-                        ),
-                        headers={"Content-Type": "application/msgpack"},
-                    )
-                    t1 = time.perf_counter()
-                    micro_result["pre_bwd_ms"] = (t1 - t0) * 1000.0
-
-                # ---------- 专家梯度通信 (NSGA-II + 热/冷模式区分) ----------
-                if USE_NSGA2 and "expert_grads" in rb:
-                    grads = rb["expert_grads"]
-                    if grads:
-                        grad_bytes_local = _est_grad_bytes(grads)
-                        micro_result["grad_bytes"] = grad_bytes_local
-                        log(
-                            f"[train] expert_grads size ≈ {grad_bytes_local / 1e6:.3f} MB, "
-                            f"hot={sorted(micro_result['hot_experts'])}, cold={sorted(micro_result['cold_experts'])}",
-                        )
-
-                        all_modes = feasible_modes()
-
-                        # 本 step 参与路由的逻辑专家集合（来自 hot/cold）
-                        expert_ids = set()
-                        for e in micro_result["hot_experts"]:
-                            expert_ids.add(e)
-                        for e in micro_result["cold_experts"]:
-                            expert_ids.add(e)
-
-                        for eid_int in sorted(expert_ids):
-                            eid_str = str(eid_int)
-
-                            # 根据函数名从实例池 + func_map 获取候选实例
-                            func_name_grad = f"moe.expert_apply_grad:{eid_str}"
-                            inst_list = get_candidate_instances_for_func(func_name_grad)
-                            if not inst_list:
-                                continue
-
-                            if eid_int in micro_result["cold_experts"]:
-                                micro_result["cold_total"] += 1
-
-                            if eid_int in micro_result["cold_experts"] and (global_step % COLD_ACC_STEPS) != 0:
-                                micro_result["cold_skipped"] += 1
-                                log(
-                                    "controller",
-                                    f"[train] skip cold expert eid={eid_str} at step={global_step} "
-                                    f"due to COLD_ACC_STEPS={COLD_ACC_STEPS}",
-                                )
-                                continue
-
-                            if eid_int in micro_result["hot_experts"]:
-                                candidate_modes = [m for m in all_modes if m in ("hot", "http")]
-                            elif eid_int in micro_result["cold_experts"]:
-                                candidate_modes = [m for m in all_modes if m in ("cold", "http")]
-                            else:
-                                candidate_modes = list(all_modes)
-
-                            if not candidate_modes:
-                                continue
-
-                            req = {
-                                "grad_bytes": grad_bytes_local,
-                                "price_cents_s": DEFAULT_PRICE_CENTS_S,
-                            }
-
-                            log(
-                                "controller",
-                                f"[train] NSGA-II for expert {eid_str}, modes={candidate_modes}",
-                            )
-                            choice = nsga2_select(
-                                inst_list,
-                                req,
-                                deadline_ms=STEP_PERIOD_MS,
-                                pop_size=8,
-                                generations=3,
-                                seed=42,
-                                modes=candidate_modes,
-                            )
-                            log(
-                                "controller",
-                                f"[train] NSGA-II result for eid={eid_str}: {choice}",
-                            )
-
-                            if choice is None:
-                                continue
-
-                            inst, mode = choice
-                            url = inst.get("url", "").rstrip("/")
-
-                            # 计时：将所有模式的通信时间统一计入 expert_comm_ms
-                            t_comm0 = time.perf_counter()
-                            if mode == "hot":
-                                COMM.send_hot(eid_str, grads)
-                                log(
-                                    "controller",
-                                    f"[train] send_hot to expert {eid_str} (mode=hot), inst={inst.get('id')}",
-                                )
-                            elif mode == "cold":
-                                COMM.send_cold(eid_str, grads)
-                                log(
-                                    "controller",
-                                    f"[train] send_cold to expert {eid_str} (mode=cold), inst={inst.get('id')}",
-                                )
-                            else:
-                                await client.post(
-                                    url + "/grad/apply",
-                                    content=dumps({"grads": grads}),
-                                    headers={"Content-Type": "application/msgpack"},
-                                )
-                                log(
-                                    "controller",
-                                    f"[train] /grad/apply via http eid={eid_str}, inst={inst.get('id')}",
-                                )
-                            t_comm1 = time.perf_counter()
-                            comm_latency_ms = (t_comm1 - t_comm0) * 1000.0
-                            micro_result["expert_comm_ms"] += comm_latency_ms
-
-                            # LightGBM 在线样本记录：expert 通信延迟
-                            try:
-                                record_lgb_training_sample(
-                                    func_type="moe.expert_apply_grad",
-                                    logical_id=eid_int,
-                                    inst=inst,
-                                    req={"tokens": int(tokens), "emb_dim": int(0)},
-                                    latency_ms=comm_latency_ms,
-                                )
-                            except Exception as e:
-                                log(
-                                    "controller",
-                                    f"[warn] record_lgb_training_sample(expert) failed: {e}",
-                                )
-
-                            micro_result["dispatch_count"] += 1
-                            if mode in micro_result["mode_counts"]:
-                                micro_result["mode_counts"][mode] += 1
-                            else:
-                                micro_result["mode_counts"][mode] = 1
-                            inst_id = inst.get("id") or inst.get("url") or str(inst)
-                            micro_result["inst_choice_counts"][inst_id] += 1
-
-                            return micro_result
-
-        micro_tasks = []
+        # 2. 并行执行所有微批次
+        tasks = []
         for m in range(micro_batches):
-            x_mb = x_ids[m * micro_bs: (m + 1) * micro_bs]
-            y_mb = target_ids[m * micro_bs: (m + 1) * micro_bs]
-            micro_tasks.append(run_microbatch(m, x_mb, y_mb))
+            x_mb = x[m * micro_bs : (m + 1) * micro_bs]
+            y_mb = y[m * micro_bs : (m + 1) * micro_bs]
 
-        micro_results = await asyncio.gather(*micro_tasks)
+            tasks.append(
+                process_micro_batch(
+                    client=client,
+                    comm_manager=COMM,
+                    x_mb=x_mb,
+                    y_mb=y_mb,
+                    micro_id=global_step,  # 也可以传 global_step * micro_batches + m
+                    tokens=tokens,
+                    train=train,
+                )
+            )
 
-        for res in micro_results:
-            agg_loss += res["loss"]
-            agg_top1 += res["acc_top1"]
-            agg_top5 += res["acc_top5"]
-            pre_lat_all += res["pre_lat_ms"]
-            post_lat_all += res["post_lat_ms"]
-            post_bwd_all += res["post_bwd_ms"]
-            pre_bwd_all += res["pre_bwd_ms"]
-            expert_comm_ms += res["expert_comm_ms"]
-            grad_bytes += res["grad_bytes"]
-            dispatch_count += res["dispatch_count"]
-            hot_experts_step.update(res["hot_experts"])
-            cold_experts_step.update(res["cold_experts"])
-            cold_total += res["cold_total"]
-            cold_skipped += res["cold_skipped"]
+        # 核心并发点
+        results = await asyncio.gather(*tasks)
 
-            for mode_name, cnt in res["mode_counts"].items():
-                mode_counts[mode_name] = mode_counts.get(mode_name, 0) + cnt
-            for inst_id, cnt in res["inst_choice_counts"].items():
-                                inst_choice_counts[inst_id] += cnt
+    # 3. 聚合指标
+    agg_loss = sum(r["loss"] for r in results)
+    agg_top1 = sum(r["acc_top1"] for r in results)
+    agg_top5 = sum(r["acc_top5"] for r in results)
 
-        # ---------- pre / post：所有共享参数模块 step ----------
-        if train:
-            # pre / post：对所有实例做 step（单 step 内累积的所有微批梯度在此统一更新）
-            async with httpx.AsyncClient() as client_step:
-                for iid in PRE_STEP_INSTANCE_IDS:
-                    inst = INST_BY_ID.get(iid)
-                    if inst is None:
-                        continue
-                    url = inst.get("url", "").rstrip("/")
-                    await client_step.post(url + "/step")
+    pre_lat_all = sum(r["pre_lat"] for r in results)
+    post_lat_all = sum(r["post_lat"] for r in results)
+    post_bwd_all = sum(r["post_bwd"] for r in results)
+    pre_bwd_all = sum(r["pre_bwd"] for r in results)
+    expert_comm_ms = sum(r["expert_comm"] for r in results)
+    grad_bytes = sum(r["grad_bytes"] for r in results)
+    expert_inst_cnt = len(EXPERT_INSTANCE_IDS)
 
-                for iid in POST_STEP_INSTANCE_IDS:
-                    inst = INST_BY_ID.get(iid)
-                    if inst is None:
-                        continue
-                    url = inst.get("url", "").rstrip("/")
-                    await client_step.post(url + "/step")
+    # 集合合并
+    hot_experts_step = set().union(*[r["hot_experts"] for r in results])
+    cold_experts_step = set().union(*[r["cold_experts"] for r in results])
 
-            # NOTE:
-            # 专家参数的 step 不再由 controller 触发，
-            # 而是由 expert_app 内的 grad_poll_loop 自主决定。
+    dispatch_count = sum(r["dispatch_count"] for r in results)
+    cold_total = sum(r["cold_total"] for r in results)
+    cold_skipped = sum(r["cold_skipped"] for r in results)
 
-    # ---------- 端到端 step 时间 ----------
+    mode_counts = defaultdict(int)
+    inst_choice_counts = defaultdict(int)
+    for r in results:
+        for k, v in r["mode_counts"].items():
+            mode_counts[k] += v
+        for k, v in r["inst_choice_counts"].items():
+            inst_choice_counts[k] += v
+
     t_step1 = time.perf_counter()
     step_time_ms = (t_step1 - t_step0) * 1000.0
 
-    # ---------- 论文级调度行为指标计算 ----------
+    # 4. 计算论文指标
     if hot_experts_step or cold_experts_step:
         denom = len(hot_experts_step) + len(cold_experts_step)
         hot_ratio = len(hot_experts_step) / denom
@@ -808,28 +648,22 @@ async def run_step(
     else:
         inst_entropy = 0.0
 
-    # ---------- 指标记录 ----------
-    mb = micro_batches
-
+    # 5. 指标记录
     step_metrics = StepMetrics(
         step=global_step,
         phase=phase,
-        # 模型效果类
-        loss=agg_loss / mb,
-        acc_top1=agg_top1 / mb,
-        acc_top5=agg_top5 / mb,
-        # 规模相关信息
+        loss=agg_loss / micro_batches,
+        acc_top1=agg_top1 / micro_batches,
+        acc_top5=agg_top5 / micro_batches,
         batch_size=BATCH_SIZE,
         seq_len=BLOCK_SIZE,
         tokens=tokens,
-        # 性能类
-        pre_fwd_ms=pre_lat_all / mb,
-        post_fwd_ms=post_lat_all / mb,
-        post_bwd_ms=post_bwd_all / mb,
-        pre_bwd_ms=pre_bwd_all / mb,
+        pre_fwd_ms=pre_lat_all / micro_batches,
+        post_fwd_ms=post_lat_all / micro_batches,
+        post_bwd_ms=post_bwd_all / micro_batches,
+        pre_bwd_ms=pre_bwd_all / micro_batches,
         step_time_ms=step_time_ms,
-        # 通信 & 调度类
-        expert_comm_ms=expert_comm_ms,
+        expert_comm_ms=expert_comm_ms,  # 累计时间，反映总通信开销
         grad_bytes=grad_bytes,
         expert_inst_cnt=expert_inst_cnt,
         dispatch_count=dispatch_count,
@@ -844,8 +678,19 @@ async def run_step(
     global _train_acc, _train_count
 
     if phase == "train":
-        # ===== 窗口累积，用于窗口平均 =====
+        # 共享参数更新 (Step) - 放在所有微批次完成后统一执行
+        async with httpx.AsyncClient() as client_step:
+            for iid in PRE_STEP_INSTANCE_IDS:
+                inst = INST_BY_ID.get(iid)
+                if inst:
+                    await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+            for iid in POST_STEP_INSTANCE_IDS:
+                inst = INST_BY_ID.get(iid)
+                if inst:
+                    await client_step.post(inst.get("url", "").rstrip("/") + "/step")
+
         _train_count += 1
+        # 累积指标...
         _train_acc["loss"] += step_metrics.loss
         _train_acc["acc_top1"] += step_metrics.acc_top1
         _train_acc["acc_top5"] += step_metrics.acc_top5
@@ -863,11 +708,10 @@ async def run_step(
         _train_acc["mode_cold_frac"] += step_metrics.mode_cold_frac
         _train_acc["mode_http_frac"] += step_metrics.mode_http_frac
 
-        # ===== 到达窗口边界，写一条“窗口平均”记录 =====
         if _train_count >= LOG_TRAIN_EVERY:
             avg = 1.0 / _train_count
             avg_metrics = StepMetrics(
-                step=global_step,  # 使用窗口末尾的 step 作为横坐标
+                step=global_step,
                 phase="train",
                 loss=_train_acc["loss"] * avg,
                 acc_top1=_train_acc["acc_top1"] * avg,
@@ -895,11 +739,9 @@ async def run_step(
             _train_acc = defaultdict(float)
             _train_count = 0
             return
-
-        # 未到窗口边界：暂不写 train step
         return
 
-    # val 阶段：每次验证 step 都直接写（由 VAL_INTERVAL 控制调用频率）
+    # val phase
     metrics_logger.log(step_metrics)
 
 
