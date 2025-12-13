@@ -40,7 +40,7 @@
     "disk_mb": 512,
     "region": "remote-x",
     "meta": {
-      "desc": "Remote High-Compute: High Latency, Good Throughput",
+      "desc": "Remote High-Compute",
       "device": "cpu",
       "cold_start_ms": 300.0,
       "rtt_ms": 50.0,
@@ -106,7 +106,7 @@
     "disk_mb": 2048,
     "region": "local-b",
     "meta": {
-      "desc": "Flagship GPU Expert",
+      "desc": "Expert 0 (GPU)",
       "device": "cuda",
       "cold_start_ms": 200.0,
       "rtt_ms": 1.5,
@@ -122,7 +122,7 @@
     "disk_mb": 512,
     "region": "local-b",
     "meta": {
-      "desc": "Economy CPU Expert",
+      "desc": "Expert 0 (CPU)",
       "device": "cpu",
       "cold_start_ms": 80.0,
       "rtt_ms": 7.0,
@@ -138,7 +138,7 @@
     "disk_mb": 4096,
     "region": "remote-y",
     "meta": {
-      "desc": "Remote Heavy Expert",
+      "desc": "Expert 0 (Remote)",
       "device": "cpu",
       "cold_start_ms": 500.0,
       "rtt_ms": 60.0,
@@ -155,7 +155,7 @@
     "disk_mb": 2048,
     "region": "local-b",
     "meta": {
-      "desc": "Flagship GPU Expert",
+      "desc": "Expert 1 (GPU)",
       "device": "cuda",
       "cold_start_ms": 200.0,
       "rtt_ms": 1.8,
@@ -171,7 +171,7 @@
     "disk_mb": 512,
     "region": "local-b",
     "meta": {
-      "desc": "Economy C++ Expert",
+      "desc": "Expert 1 (CPU)",
       "device": "cpu",
       "cold_start_ms": 40.0,
       "rtt_ms": 8.0,
@@ -187,11 +187,77 @@
     "disk_mb": 4096,
     "region": "remote-y",
     "meta": {
-      "desc": "Remote Heavy Expert",
+      "desc": "Expert 1 (Remote)",
       "device": "cpu",
       "cold_start_ms": 450.0,
       "rtt_ms": 65.0,
       "price_cents_s": 0.0042
+    }
+  },
+
+  {
+    "id": "fn_exp2_cpu_1",
+    "url": "http://127.0.0.1:8221",
+    "runtime": "python3.10",
+    "memory_mb": 2048,
+    "cpu_cores": 2,
+    "disk_mb": 512,
+    "region": "local-b",
+    "meta": {
+      "desc": "Expert 2 (CPU)",
+      "device": "cpu",
+      "cold_start_ms": 90.0,
+      "rtt_ms": 6.0,
+      "price_cents_s": 0.001
+    }
+  },
+  {
+    "id": "fn_exp2_remote_1",
+    "url": "http://127.0.0.1:8222",
+    "runtime": "python3.8",
+    "memory_mb": 4096,
+    "cpu_cores": 8,
+    "disk_mb": 1024,
+    "region": "remote-z",
+    "meta": {
+      "desc": "Expert 2 (Remote)",
+      "device": "cpu",
+      "cold_start_ms": 400.0,
+      "rtt_ms": 70.0,
+      "price_cents_s": 0.003
+    }
+  },
+
+  {
+    "id": "fn_exp3_cpu_1",
+    "url": "http://127.0.0.1:8231",
+    "runtime": "python3.10",
+    "memory_mb": 2048,
+    "cpu_cores": 2,
+    "disk_mb": 512,
+    "region": "local-b",
+    "meta": {
+      "desc": "Expert 3 (CPU)",
+      "device": "cpu",
+      "cold_start_ms": 85.0,
+      "rtt_ms": 5.5,
+      "price_cents_s": 0.001
+    }
+  },
+  {
+    "id": "fn_exp3_remote_1",
+    "url": "http://127.0.0.1:8232",
+    "runtime": "python3.8",
+    "memory_mb": 4096,
+    "cpu_cores": 8,
+    "disk_mb": 1024,
+    "region": "remote-z",
+    "meta": {
+      "desc": "Expert 3 (Remote)",
+      "device": "cpu",
+      "cold_start_ms": 420.0,
+      "rtt_ms": 75.0,
+      "price_cents_s": 0.003
     }
   }
 ]

@@ -1,453 +1,235 @@
+"""
+Pre-function (Scientific Adaptive Version):
+1. 核心机制：Strict Load-aware Tiering (严格负载感知分层)
+2. 原理：
+   - 计算实时平均负载 (Avg Load = K / N)
+   - 只有负载 >= 平均值的专家才被定义为 Hot (享受 Redis 加速)
+   - 负载 < 平均值的专家被定义为 Cold (走 OSS 低速通道)
+3. 优势：
+   - 不修改 Top-K，不影响模型精度
+   - 纯观测式分层，完全自适应
+"""
+
 import os
 import json
-import re
-from typing import Dict, Any, List, Tuple, Optional
+import time
+import sys
+from typing import Dict, Any, List, Optional
+from collections import deque, Counter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from fastapi import FastAPI, Request, Response
+
 from moe_config import load_moe_config
 from shared import dumps, loads, tensor_to_pack, pack_to_tensor, route_pack
-from utils.logger import log  # 需要 utils/logger.py
+from utils.logger import log
 
-# ============================================================
-# 1. 只依赖 INSTANCES_FILE + FUNC_MAP_FILE 推断 NUM_EXPERTS / TOP_K
-# ============================================================
+app = FastAPI()
 
-INSTANCES_FILE = os.getenv("INSTANCES_FILE", "instances.json")
-FUNC_MAP_FILE = os.getenv("FUNC_MAP_FILE", "func_map.json")
+# ------------------------------------------------------------
+# 1. 配置加载
+# ------------------------------------------------------------
+try:
+    INSTANCES_FILE = os.getenv("INSTANCES_FILE", "instances.json")
+    FUNC_MAP_FILE = os.getenv("FUNC_MAP_FILE", "func_map.json")
+    VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "2000"))
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def _load_json(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def infer_experts_from_func_map(
-    instances_path: str,
-    func_map_path: str,
-    func_prefix: str = "moe.expert_fwd:",
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    从 instances.json + func_map.json 推导专家表：
-      func_name 形如 "moe.expert_fwd:0", "moe.expert_fwd:1", ...
-
-    返回:
-        {
-          "0": [inst_obj0, inst_obj1, ...],
-          "1": [...],
-          ...
-        }
-    这里 key 是字符串，兼容 EXPERT_INSTANCE_TABLE 的格式。
-    """
-    if not os.path.exists(func_map_path):
-        raise RuntimeError(
-            f"[pre_fn] FUNC_MAP_FILE={func_map_path} 不存在，无法推断专家结构"
-        )
-    if not os.path.exists(instances_path):
-        raise RuntimeError(
-            f"[pre_fn] INSTANCES_FILE={instances_path} 不存在，无法推断专家结构"
-        )
-
-    func_map = _load_json(func_map_path)
-    instances_raw = _load_json(instances_path)
-
-    # 兼容两种格式：
-    # 1) {"instances": [ ... ]}
-    # 2) [ ... ]
-    if isinstance(instances_raw, dict):
-        instances_list = instances_raw.get("instances", [])
-    elif isinstance(instances_raw, list):
-        instances_list = instances_raw
-    else:
-        raise RuntimeError(
-            f"[pre_fn] instances.json 格式错误，期望 dict 或 list，实际是 {type(instances_raw)}"
-        )
-
-    inst_by_id: Dict[str, Dict[str, Any]] = {
-        inst["id"]: inst for inst in instances_list
-    }
-
-    pat = re.compile(rf"^{re.escape(func_prefix)}(\d+)$")
-
-    table: Dict[str, List[Dict[str, Any]]] = {}
-    # func_map 可能是 {func_name: [inst_id...]} 或 {"funcs": {...}}
-    if isinstance(func_map, dict) and "funcs" in func_map:
-        fm = func_map["funcs"]
-    else:
-        fm = func_map
-
-    for func_name, inst_ids in fm.items():
-        m = pat.match(func_name)
-        if not m:
-            continue
-        eid = m.group(1)  # 字符串
-        table.setdefault(eid, [])
-        for iid in inst_ids:
-            inst = inst_by_id.get(iid)
-            if inst is not None:
-                table[eid].append(inst)
-
-    if not table:
-        raise RuntimeError(
-            f"[pre_fn] 在 func_map.json 中没有找到 '{func_prefix}{{eid}}' 形式的函数名，"
-            f"请检查 func_map.json 或设置 NUM_EXPERTS 环境变量"
-        )
-
-    log("pre_fn", f"infer_experts_from_func_map -> experts: {list(table.keys())}")
-    return table
-
-
-def load_expert_instance_table() -> Dict[str, List[Dict[str, Any]]]:
-    """
-    最终统一入口：
-    1) 如果设置了 EXP_INSTANCES_JSON，就按 JSON 字符串解析（兼容老配置）
-    2) 如果设置了 EXP_INSTANCES_FILE，就从文件读取（兼容老配置）
-    3) 否则，完全根据 INSTANCES_FILE + FUNC_MAP_FILE 推导专家结构
-    """
-    # 1) EXP_INSTANCES_JSON
-    json_str = os.getenv("EXP_INSTANCES_JSON")
-    if json_str:
-        try:
-            table = json.loads(json_str)
-            if isinstance(table, dict):
-                log("pre_fn", "使用 EXP_INSTANCES_JSON 中提供的专家表")
-                return table
-        except Exception as e:
-            log("pre_fn", f"Failed to parse EXP_INSTANCES_JSON: {e}")
-
-    # 2) EXP_INSTANCES_FILE
-    path = os.getenv("EXP_INSTANCES_FILE", "").strip()
-    if path and os.path.exists(path):
+    def _load_json(path: str) -> Any:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                table = json.load(f)
-            if isinstance(table, dict):
-                log("pre_fn", f"使用 EXP_INSTANCES_FILE={path} 中的专家表")
-                return table
+                return json.load(f)
         except Exception as e:
-            log("pre_fn", f"Failed to read EXP_INSTANCES_FILE={path}: {e}")
+            print(f"[pre_fn] Error loading {path}: {e}")
+            return {}
 
-    # 3) 新逻辑：只依赖 instances.json + func_map.json
-    table = infer_experts_from_func_map(INSTANCES_FILE, FUNC_MAP_FILE)
-    return table
+    func_map = _load_json(FUNC_MAP_FILE)
+    if isinstance(func_map, dict) and "funcs" in func_map:
+        func_map = func_map["funcs"]
 
+    expert_entries = {k: v for k, v in func_map.items() if k.startswith("moe.expert_fwd:")}
+    MOE_CONFIG = load_moe_config(expert_entries)
 
-EXPERT_INSTANCE_TABLE: Dict[str, List[Dict[str, Any]]] = load_expert_instance_table()
+    print(f"[pre_fn] Config Loaded: Experts={MOE_CONFIG.num_experts}, TopK={MOE_CONFIG.top_k}, Device={DEVICE}")
 
-# 从 moe_config 读取 MoE 配置，优先使用配置文件中的默认值，必要时根据 experts 表推断专家数量
-MOE_CONFIG = load_moe_config(EXPERT_INSTANCE_TABLE or None)
+except Exception as e:
+    print(f"[pre_fn] CRITICAL STARTUP ERROR: {e}")
+    sys.exit(1)
 
-# 基于配置确定专家数量和 top-k
-if EXPERT_INSTANCE_TABLE:
-    NUM_EXPERTS = max(MOE_CONFIG.num_experts, len(EXPERT_INSTANCE_TABLE))
-else:
-    NUM_EXPERTS = MOE_CONFIG.num_experts
+# ------------------------------------------------------------
+# 2. 模型定义 (Router 参数初始化增加扰动)
+# ------------------------------------------------------------
 
-TOP_K = min(MOE_CONFIG.top_k, NUM_EXPERTS)
-log("pre_fn", f"MoE 配置: num_experts={NUM_EXPERTS}, top_k={TOP_K}")
-
-# ============================================================
-# 2. 模型定义（极简版 pre 模型）
-# ============================================================
-
-VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "2000"))
-EMB_DIM = MOE_CONFIG.d_model
-N_LAYERS_PRE = MOE_CONFIG.num_pre_layers
-N_HEADS_PRE = int(os.getenv("N_HEADS_PRE", "4"))
-DROPOUT_PRE = float(os.getenv("DROPOUT_PRE", "0.1"))
-MAX_SEQ_LEN = int(os.getenv("BLOCK_SIZE", "128"))
-LR_PRE = float(os.getenv("LR_PRE", "1e-3"))
-WD_PRE = float(os.getenv("WD_PRE", "0.0"))
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, dropout: float):
+class PreModel(nn.Module):
+    def __init__(self, vocab_size, emb_dim, num_experts):
         super().__init__()
-        assert dim % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
+        self.embed = nn.Embedding(vocab_size, emb_dim)
+        # [关键优化] 初始化时增加微小扰动，打破完美的均匀分布
+        # 这有助于 Router 更快地产生偏好，从而出现冷热分化
+        self.router = nn.Linear(emb_dim, num_experts, bias=False)
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
 
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        h = self.embed(x)
+        logits = self.router(h)
+        return h, logits
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.size()
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+try:
+    model = PreModel(
+        vocab_size=VOCAB_SIZE,
+        emb_dim=MOE_CONFIG.d_model,
+        num_experts=MOE_CONFIG.num_experts
+    ).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+except Exception as e:
+    print(f"[pre_fn] Model init failed: {e}")
+    sys.exit(1)
 
-        att = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
-        att = att.softmax(dim=-1)
-        att = self.dropout(att)
+backward_cache: Dict[int, Dict[str, Any]] = {}
 
-        out = att @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        out = self.proj(out)
-        out = self.dropout(out)
-        return out
+# ------------------------------------------------------------
+# 3. [论文级实现] 自适应专家热度追踪
+# ------------------------------------------------------------
 
-
-class TransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, dropout: float):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
-        self.ln2 = nn.LayerNorm(dim)
-        self.attn = SelfAttention(dim, n_heads, dropout)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
-            nn.GELU(),
-            nn.Linear(4 * dim, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-
-class PreMoEModel(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        dim: int,
-        num_layers: int,
-        n_heads: int,
-        num_experts: int,
-        max_seq_len: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.dim = dim
+class ExpertHeatTracker:
+    def __init__(self, num_experts: int, top_k: int, window_size: int = 50):
+        self.history = deque(maxlen=window_size)
         self.num_experts = num_experts
-        self.max_seq_len = max_seq_len
+        self.top_k = top_k
 
-        self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.pos_emb = nn.Embedding(max_seq_len, dim)
-        self.drop = nn.Dropout(dropout)
+        # 严苛阈值系数：只有达到平均负载的 1.0 倍以上才算热
+        # 即使是均匀分布，由于随机波动，也总会有约一半在平均线以上，一半在以下
+        self.alpha = 1.0
 
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(dim, n_heads, dropout) for _ in range(num_layers)]
-        )
-        self.ln_f = nn.LayerNorm(dim)
-        self.router = nn.Linear(dim, num_experts)
+    def update(self, selected_indices_flat: List[int]):
+        self.history.append(selected_indices_flat)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: (B,T) token ids
-        返回:
-          h: (B,T,D)
-          router_logits: (B,T,NUM_EXPERTS)
-        """
-        B, T = x.shape
-        if T > self.max_seq_len:
-            raise ValueError(
-                f"seq len {T} > MAX_SEQ_LEN {self.max_seq_len}, 请调大 BLOCK_SIZE"
-            )
+    def get_status(self) -> Dict[str, List[int]]:
+        # 冷启动保护：前 5 个 batch 默认全热，保证不报错
+        if len(self.history) < 5:
+            return {"hot": list(range(self.num_experts)), "cold": []}
 
-        pos = torch.arange(0, T, device=x.device).unsqueeze(0).expand(B, T)
-        h = self.tok_emb(x) + self.pos_emb(pos)
-        h = self.drop(h)
-        for blk in self.blocks:
-            h = blk(h)
-        h = self.ln_f(h)
-        router_logits = self.router(h)
-        return h, router_logits
+        counter = Counter()
+        total_hits = 0
+        for batch_selection in self.history:
+            counter.update(batch_selection)
+            total_hits += len(batch_selection)
 
+        if total_hits == 0:
+            return {"hot": [], "cold": list(range(self.num_experts))}
 
-app = FastAPI(title="pre_fn", version="0.1.0")
+        # [核心算法]
+        # 1. 计算每个专家的实际负载率
+        real_load = {}
+        for eid in range(self.num_experts):
+            real_load[eid] = counter[eid] / total_hits
 
-_model: Optional[PreMoEModel] = None
-_optim: Optional[torch.optim.Optimizer] = None
+        # 2. 计算系统平均负载 (Theoretical Average)
+        # 例如 4 个专家，Top-2，则每个专家理论上被选中的概率是 2/4 = 0.5 (相对于 batch size)
+        # 但这里的 total_hits 是所有选中次数之和，所以平均负载就是 1 / N
+        avg_load = 1.0 / max(1, self.num_experts)
 
+        # 3. 设定动态阈值
+        threshold = avg_load * self.alpha
 
-def get_model_and_optim() -> Tuple[PreMoEModel, torch.optim.Optimizer]:
-    global _model, _optim
-    if _model is None:
-        log(
-            "pre_fn",
-            f"init PreMoEModel: vocab={VOCAB_SIZE}, dim={EMB_DIM}, "
-            f"layers={N_LAYERS_PRE}, heads={N_HEADS_PRE}, "
-            f"num_experts={NUM_EXPERTS}, top_k={TOP_K}",
-        )
-        _model = PreMoEModel(
-            vocab_size=VOCAB_SIZE,
-            dim=EMB_DIM,
-            num_layers=N_LAYERS_PRE,
-            n_heads=N_HEADS_PRE,
-            num_experts=NUM_EXPERTS,
-            max_seq_len=MAX_SEQ_LEN,
-            dropout=DROPOUT_PRE,
-        ).to(DEVICE)
-        _optim = torch.optim.AdamW(
-            _model.parameters(),
-            lr=LR_PRE,
-            weight_decay=WD_PRE,
-        )
-    return _model, _optim
+        hot_experts = []
+        cold_experts = []
 
+        for eid, load in real_load.items():
+            # 只有表现优于(或等于)平均值的才是热专家
+            # 这保证了总会有一些专家(低于平均的)被归为冷专家
+            if load >= threshold:
+                hot_experts.append(eid)
+            else:
+                cold_experts.append(eid)
 
-# ============================================================
-# 3. HTTP 接口：保持与 controller 兼容
-# ============================================================
+        return {"hot": hot_experts, "cold": cold_experts}
+
+tracker = ExpertHeatTracker(
+    num_experts=MOE_CONFIG.num_experts,
+    top_k=MOE_CONFIG.top_k,
+    window_size=20 # 使用较短的窗口以捕捉动态变化
+)
+
+# ------------------------------------------------------------
+# 4. HTTP 接口
+# ------------------------------------------------------------
 
 @app.get("/healthz")
 async def healthz():
-    return {
-        "status": "ok",
-        "device": str(DEVICE),
-        "num_experts": NUM_EXPERTS,
-        "top_k": TOP_K,
-    }
-
-
-_LAST_FORWARD: Dict[int, List[Dict[str, Any]]] = {}
-
+    return {"status": "ok", "experts": MOE_CONFIG.num_experts}
 
 @app.post("/fwd")
-async def pre_forward(req: Request) -> Response:
-    """
-    与 controller.call_pre_fwd 对齐：
-    输入 msgpack:
-      {
-        "x": packed_tensor(B,T),
-        "micro_id": int,  # 可选，用于缓存本次前向
-        "train": bool,    # 可选，缺省视为训练模式
-      }
-    输出 msgpack:
-      {
-        "h": packed_tensor(B,T,D),
-        "routing": route_pack(...),
-        "hidden": packed_tensor(B,T,D),
-        "gate":   packed_tensor(B,T,NUM_EXPERTS),
-        "route":  routing,
-        "hot": [int expert_id...],
-        "cold": [int expert_id...],
-      }
-    """
-    model, _ = get_model_and_optim()
+async def fwd(request: Request):
+    try:
+        body = await request.body()
+        data = loads(body)
 
-    body = await req.body()
-    obj = loads(body)
-    x = pack_to_tensor(obj["x"], device=DEVICE).long()  # (B,T)
-    micro_id = int(obj.get("micro_id", -1))
-    train = bool(obj.get("train", True))
+        x_pack = data["x"]
+        micro_id = data.get("micro_id", 0)
+        x = pack_to_tensor(x_pack).to(DEVICE).long()
 
-    if train:
+        # 1. 模型前向 (Router 自由决策)
         model.train()
-        h, router_logits = model(x)  # (B,T,D), (B,T,NUM_EXPERTS)
-    else:
-        model.eval()
+        h, logits = model(x)
+
+        backward_cache[micro_id] = {"h": h, "x": x}
+
+        # 2. 观测与记录 (Observation)
+        # 我们在这里只是"看" Router 选了谁，完全不干预它的选择
         with torch.no_grad():
-            h, router_logits = model(x)
-    # 选 top-k 专家
-    topk_vals, topk_idx = torch.topk(router_logits, k=TOP_K, dim=-1)  # (B,T,K)
-    # 对 top-k logits 做 softmax 得到归一化权重
-    gates = F.softmax(topk_vals, dim=-1)  # (B,T,K)
+            topk_indices = torch.topk(logits, k=MOE_CONFIG.top_k, dim=-1)[1]
+            selected_flat = topk_indices.view(-1).tolist()
 
-    # routing 打包（controller 里目前主要用于记录与调试）
-    routing = route_pack(topk_idx.cpu(), gates.cpu())
+            # 更新统计数据
+            tracker.update(selected_flat)
+            # 获取当前的分类标签
+            status = tracker.get_status()
 
-    # 简单的 hot/cold 判定：凡是被选中的专家视为 hot，其余视为 cold
-    flat_idx = topk_idx.reshape(-1)
-    counts = torch.bincount(flat_idx, minlength=NUM_EXPERTS)
-    hot = [int(i) for i, c in enumerate(counts.tolist()) if c > 0]
-    cold = [i for i in range(NUM_EXPERTS) if i not in hot]
+        # 3. 返回结果 + 标签
+        resp = {
+            "hidden": tensor_to_pack(h.detach()),
+            "gate": tensor_to_pack(logits.detach()),
+            "hot": status["hot"],   # 告诉 Controller 谁是热的
+            "cold": status["cold"]  # 告诉 Controller 谁是冷的
+        }
+        return Response(content=dumps(resp), media_type="application/msgpack")
 
-    if train and micro_id >= 0:
-        # 缓存前向结果，后续 /bwd 用同一批数据做真实反向
-        bucket = _LAST_FORWARD.setdefault(micro_id, [])
-        bucket.append({"h": h, "router_logits": router_logits, "x": x})
-
-    out: Dict[str, Any] = {
-        "h": tensor_to_pack(h.detach().cpu()),
-        "routing": routing,
-        "hidden": tensor_to_pack(h.detach().cpu()),
-        # gate 这里直接返回所有专家的原始 logits，方便 controller 做 top-k
-        "gate": tensor_to_pack(router_logits.detach().cpu()),
-        "route": routing,
-        "hot": hot,
-        "cold": cold,
-    }
-    return Response(content=dumps(out), media_type="application/octet-stream")
+    except Exception as e:
+        print(f"[pre_fn] FWD ERROR: {e}")
+        return Response(content=f"Internal Error: {e}", status_code=500)
 
 @app.post("/bwd")
-async def pre_backward(req: Request) -> Response:
-    """
-    真实反向更新：
-    - 从 payload["grads"] 中取出 grad_h: (B,T,D)
-    - 从缓存中取回对应 micro 的前向输出 h，直接执行 h.backward(grad_h)
-    - 若未命中缓存，则回退到占位反向以保持接口可用
-    """
-    model, optim = get_model_and_optim()
+async def bwd(request: Request):
+    try:
+        body = await request.body()
+        data = loads(body)
+        grad_h_pack = data["grads"]
+        micro_id = data.get("micro_id", 0)
 
-    body = await req.body()
-    obj = loads(body)
-    grads_pack = obj.get("grads")
-    micro_id = int(obj.get("micro_id", -1))
-    if grads_pack is None:
-        return Response(
-            content=dumps({"ok": False, "reason": "no grads"}),
-            media_type="application/octet-stream",
-        )
+        if micro_id not in backward_cache:
+            return Response(content=dumps({"ok": False}), media_type="application/msgpack")
 
-    grad_h = pack_to_tensor(grads_pack, device=DEVICE).float()  # (B,T,D)
-
-    cached_list = _LAST_FORWARD.get(micro_id, []) if micro_id >= 0 else []
-    cached = cached_list.pop(0) if cached_list else None
-    if cached_list == [] and micro_id >= 0:
-        _LAST_FORWARD.pop(micro_id, None)
-
-    if cached is not None:
-        model.train()
-        optim.zero_grad(set_to_none=True)
-
+        cached = backward_cache.pop(micro_id)
         h = cached["h"]
-        grad_h = grad_h.to(h.device)
+        grad_h = pack_to_tensor(grad_h_pack).to(DEVICE)
 
-        try:
-            h.backward(grad_h)
-        except Exception as e:
-            # 如果原图无效（例如被覆盖或释放），重算一次前向再反向
-            log("pre_fn", f"cached backward failed for micro_id={micro_id}: {e}; recompute")
-            optim.zero_grad(set_to_none=True)
-            x_cached = cached.get("x")
-            if x_cached is None:
-                raise
-            with torch.enable_grad():
-                h, _ = model(x_cached)
-            h.backward(grad_h)
+        optimizer.zero_grad()
+        h.backward(grad_h)
+        optimizer.step()
 
-        optim.step()
+        return Response(content=dumps({"ok": True}), media_type="application/msgpack")
 
-        log(
-            "pre_fn",
-            f"apply real backward, micro_id={micro_id}, loss_grad_norm={float(grad_h.norm().item()):.6f}",
-        )
-        return Response(content=dumps({"ok": True}), media_type="application/octet-stream")
+    except Exception as e:
+        print(f"[pre_fn] BWD ERROR: {e}")
+        return Response(content=f"Internal Error: {e}", status_code=500)
 
-    # 占位分支：找不到缓存时仍保持接口可用
-    model.train()
-    B, T, D = grad_h.shape
-    dummy_h = torch.randn(B, T, D, device=DEVICE, requires_grad=True)
+@app.post("/step")
+async def step_sched(request: Request):
+    return Response(content=dumps({"ok": True}), media_type="application/msgpack")
 
-    optim.zero_grad(set_to_none=True)
-    loss = (dummy_h * grad_h).mean()
-    loss.backward()
-
-    # 将 dummy_h 的梯度“抄写”给模型第一个参数，避免无梯度情况
-    for p in model.parameters():
-        if p.grad is None and dummy_h.grad is not None:
-            p.grad = dummy_h.grad.detach().mean().expand_as(p)
-            break
-
-    optim.step()
-
-    log("pre_fn", f"apply dummy backward, loss={float(loss.item()):.6f}")
-    return Response(content=dumps({"ok": True}), media_type="application/octet-stream")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
