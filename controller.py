@@ -1,11 +1,11 @@
 """
-训练控制器 (Final Optimized Version)：
-- 架构：并行微批次 (Parallel Micro-batches) + 混合调度 (Heuristic + Online NN)
-- 优化：
-  1. 默认参数调整为 Batch=32, MicroBatch=4, Steps=500，大幅缩短实验时间
-  2. 实现了 Step 级指标聚合 (Buffer)，减少 CSV 写入频率
-  3. 保留了详细的调度轨迹日志 (JSONL) 用于论文分析
-  4. 包含冷启动模拟和在线学习反馈闭环
+训练控制器 (Final Optimized Version for ICWS):
+- 核心机制：并行微批次 (Parallel Micro-batches) + 混合调度 (Heuristic + Online NN)
+- 实验特性：
+  1. 真实冷启动模拟 (Cold Start Injection)
+  2. 在线学习闭环 (Latency Feedback Loop)
+  3. 资源竞争模拟 (Concurrency > Instances)
+  4. 详细调度审计 (Dispatch Tracing)
 """
 
 import os
@@ -35,7 +35,7 @@ from moe_config import load_moe_config
 DATA_PATH = os.getenv("DATA_PATH", DATA_PATH_DEFAULT)
 
 # [优化配置] 针对本地模拟调整的默认参数
-# 增大 Batch Size 以减少总 Step 数，同时利用 Micro Batches 并行
+# 增大 Batch Size (8->32) 以减少总 Step 数，同时利用 Micro Batches (1->4) 制造并行竞争
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
 BLOCK_SIZE = int(os.getenv("BLOCK_SIZE", "64"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "500"))       # 500步即可跑完约1MB数据
@@ -409,8 +409,7 @@ async def run_step(
     # 1. 获取 Batch
     x, y = batcher.next_batch()
 
-    micro_batches = MICRO_BATCHES
-    micro_bs = BATCH_SIZE // micro_batches
+    micro_bs = BATCH_SIZE // MICRO_BATCHES
     comm = CommManager()
 
     t_start = time.perf_counter()
@@ -418,7 +417,7 @@ async def run_step(
     # [核心] 并行执行 Micro Batches
     async with httpx.AsyncClient() as client:
         tasks = []
-        for m in range(micro_batches):
+        for m in range(MICRO_BATCHES):
             x_mb = x[m * micro_bs : (m + 1) * micro_bs]
             y_mb = y[m * micro_bs : (m + 1) * micro_bs]
 
@@ -443,45 +442,59 @@ async def run_step(
     if train:
         append_dispatch_log(traces)
 
-    # 聚合当前 Step 的统计值 (平均)
-    agg_loss = sum(r["loss"] for r in results) / micro_batches
-    agg_acc1 = sum(r["acc_top1"] for r in results) / micro_batches
-    step_lat = (time.perf_counter() - t_start) * 1000.0
+    # 2. 聚合当前 Step 的统计值 (求平均或求和)
+    step_metrics = {
+        "loss": sum(r["loss"] for r in results) / MICRO_BATCHES,
+        "acc1": sum(r["acc_top1"] for r in results) / MICRO_BATCHES,
+        "pre_lat": sum(r["pre_lat"] for r in results) / MICRO_BATCHES,
+        "post_lat": sum(r["post_lat"] for r in results) / MICRO_BATCHES,
+        "pre_bwd": sum(r["pre_bwd"] for r in results) / MICRO_BATCHES,
+        "post_bwd": sum(r["post_bwd"] for r in results) / MICRO_BATCHES,
+        "exp_comm": sum(r["expert_comm"] for r in results) / MICRO_BATCHES,
+        "grad_bytes": sum(r["grad_bytes"] for r in results),
+        "disp_cnt": sum(r["dispatch_count"] for r in results),
+        "step_time": (time.perf_counter() - t_start) * 1000.0
+    }
 
-    # 训练模式：触发参数更新 & 累积指标
+    # 3. 训练模式：累积并降频写入
     if train:
-        # 通知所有 Worker 更新参数
+        # 模拟参数更新
         async with httpx.AsyncClient() as client:
             for iid in PRE_STEP_INSTANCE_IDS | POST_STEP_INSTANCE_IDS:
                 if iid in INST_BY_ID:
                     try: await client.post(INST_BY_ID[iid]["url"].rstrip("/")+"/step")
                     except: pass
 
-        # 累积到 Buffer
+        # 累积到全局 Buffer
         global _metric_buffer, _metric_count
-        _metric_buffer["loss"] += agg_loss
-        _metric_buffer["acc"] += agg_acc1
-        _metric_buffer["time"] += step_lat
+        for k, v in step_metrics.items():
+            _metric_buffer[k] += v
         _metric_count += 1
 
-        # 达到记录周期，写入 CSV 并打印
+        # 达到记录周期 (LOG_TRAIN_EVERY)，计算均值并写入
         if _metric_count >= LOG_TRAIN_EVERY:
-            avg_loss = _metric_buffer['loss'] / _metric_count
-            avg_time = _metric_buffer['time'] / _metric_count
+            # 计算 Buffer 中的均值
+            avg = {k: v / _metric_count for k, v in _metric_buffer.items()}
 
-            log("controller", f"Step {global_step}: Loss={avg_loss:.4f} Time={avg_time:.1f}ms")
+            log("controller", f"Step {global_step}: Loss={avg['loss']:.4f} Time={avg['step_time']:.1f}ms")
 
-            # 构造 Metrics 对象写入 CSV
             metrics_logger.log(StepMetrics(
                 step=global_step, phase="train",
-                loss=avg_loss,
-                acc_top1=_metric_buffer['acc']/_metric_count,
+                loss=avg["loss"],
+                acc_top1=avg["acc1"],
                 acc_top5=0,
-                batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=0,
-                pre_fwd_ms=0, post_fwd_ms=0, post_bwd_ms=0, pre_bwd_ms=0,
-                step_time_ms=avg_time,
-                expert_comm_ms=0, grad_bytes=0, expert_inst_cnt=0,
-                dispatch_count=0, hot_ratio=0, cold_skip_ratio=0,
+                batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=tokens,
+                # 填充详细指标
+                pre_fwd_ms=avg["pre_lat"],
+                post_fwd_ms=avg["post_lat"],
+                post_bwd_ms=avg["post_bwd"],
+                pre_bwd_ms=avg["pre_bwd"],
+                step_time_ms=avg["step_time"],
+                expert_comm_ms=avg["exp_comm"],
+                grad_bytes=avg["grad_bytes"],
+                expert_inst_cnt=len(EXPERT_INSTANCE_IDS),
+                dispatch_count=avg["disp_cnt"],
+                hot_ratio=0, cold_skip_ratio=0,
                 mode_hot_frac=0, mode_cold_frac=0, mode_http_frac=0, inst_entropy=0
             ))
 
@@ -489,15 +502,24 @@ async def run_step(
             _metric_buffer = defaultdict(float)
             _metric_count = 0
 
-    # 验证模式：直接记录，不累积
+    # 4. 验证模式：直接记录，不累积
     else:
         metrics_logger.log(StepMetrics(
             step=global_step, phase="val",
-            loss=agg_loss, acc_top1=agg_acc1, acc_top5=0,
-            batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=0,
-            pre_fwd_ms=0, post_fwd_ms=0, post_bwd_ms=0, pre_bwd_ms=0,
-            step_time_ms=step_lat, expert_comm_ms=0, grad_bytes=0, expert_inst_cnt=0,
-            dispatch_count=0, hot_ratio=0, cold_skip_ratio=0,
+            loss=step_metrics["loss"],
+            acc_top1=step_metrics["acc1"],
+            acc_top5=0,
+            batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=tokens,
+            pre_fwd_ms=step_metrics["pre_lat"],
+            post_fwd_ms=step_metrics["post_lat"],
+            post_bwd_ms=step_metrics["post_bwd"],
+            pre_bwd_ms=step_metrics["pre_bwd"],
+            step_time_ms=step_metrics["step_time"],
+            expert_comm_ms=step_metrics["exp_comm"],
+            grad_bytes=step_metrics["grad_bytes"],
+            expert_inst_cnt=len(EXPERT_INSTANCE_IDS),
+            dispatch_count=step_metrics["disp_cnt"],
+            hot_ratio=0, cold_skip_ratio=0,
             mode_hot_frac=0, mode_cold_frac=0, mode_http_frac=0, inst_entropy=0
         ))
 
