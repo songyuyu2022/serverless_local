@@ -38,7 +38,6 @@ class StepMetrics:
 
     # -------- 通信指标 --------
     grad_bytes: Optional[float] = None          # 梯度字节数（controller 的 grad_bytes）
-    expert_inst_cnt: Optional[int] = None       # 专家实例数量
     dispatch_count: Optional[int] = None        # 调度/触发专家次数
 
     # -------- 热/冷专家行为 --------
@@ -49,10 +48,6 @@ class StepMetrics:
     mode_hot_frac: Optional[float] = None
     mode_cold_frac: Optional[float] = None
     mode_http_frac: Optional[float] = None
-
-    # -------- 调度器行为指标 --------
-    inst_entropy: Optional[float] = None        # 实例选择熵（衡量多样性）
-
 
 class MetricsLogger:
     """

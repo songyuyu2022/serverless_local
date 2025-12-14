@@ -212,37 +212,54 @@ def _est_grad_bytes(grad_dict):
 # ----------------- 6. 微批次处理 (统计收集) -----------------
 
 async def process_micro_batch(
-    client: httpx.AsyncClient,
-    comm_manager: CommManager,
-    x_mb: torch.Tensor,
-    y_mb: torch.Tensor,
-    micro_id: int,
-    mb_idx: int,
-    global_step: int,
-    tokens: int,
-    train: bool,
+        client: httpx.AsyncClient,
+        comm_manager: CommManager,
+        x_mb: torch.Tensor,
+        y_mb: torch.Tensor,
+        micro_id: int,
+        mb_idx: int,
+        global_step: int,
+        tokens: int,
+        train: bool,
 ) -> Dict[str, Any]:
-
-    # 统计容器
+    # [修复点 1] 初始化统计容器，确保默认值
     metrics = defaultdict(float, {
-        "hot_experts": set(), "cold_experts": set(),
-        "mode_counts": defaultdict(int), "inst_choice_counts": defaultdict(int)
+        "hot_experts": set(),
+        "cold_experts": set(),
+        "mode_counts": defaultdict(int),
+        "inst_choice_counts": defaultdict(int),
+        "cold_total": 0.0,  # [新增] 必须初始化
+        "cold_skipped": 0.0,
+        "dispatch_count": 0.0,
+        "grad_bytes": 0.0,
+        "expert_comm": 0.0,
+        "pre_lat": 0.0, "post_lat": 0.0, "pre_bwd": 0.0, "post_bwd": 0.0
     })
 
-    trace = {"step": global_step, "mb": mb_idx, "ts": time.time(), "pre": None, "post": None, "exp_fwd": [], "exp_bwd": []}
+    trace = {
+        "step": global_step, "mb": mb_idx, "ts": time.time(),
+        "pre": None, "post": None,
+        "exp_fwd": [], "exp_bwd": []
+    }
 
-    # 1. Pre
+    # ==========================
+    # 1. Pre Processing (Embedding + Router)
+    # ==========================
     pre_resp, pre_lat, pre_inst = await call_pre_fwd(client, tensor_to_pack(x_mb), micro_id, tokens, 0)
     metrics["pre_lat"] += pre_lat
     trace["pre"] = pre_inst.get("id")
 
-    # [关键] 收集冷热信息
+    # 收集冷热信息 (来自 pre_fn 的自适应判断)
     if "hot" in pre_resp: metrics["hot_experts"].update(pre_resp["hot"])
     metrics["cold_experts"].update(pre_resp.get("cold", []))
 
-    # 2. Router
+    # ==========================
+    # 2. Router Logic
+    # ==========================
     h = pack_to_tensor(pre_resp["hidden"]).float()
     gate_pack = pack_to_tensor(pre_resp["gate"]).float()
+
+    # 计算 Gate 分布和 Top-K 索引
     gates = F.softmax(torch.topk(gate_pack, k=TOP_K_DEFAULT, dim=-1)[0], dim=-1)
     indices = torch.topk(gate_pack, k=TOP_K_DEFAULT, dim=-1)[1]
 
@@ -253,9 +270,13 @@ async def process_micro_batch(
     for b in range(B):
         for t in range(T):
             for k in range(TOP_K_DEFAULT):
-                expert_map[int(idx_np[b,t,k])].append((b,t,k, float(gate_np[b,t,k])))
+                eid = int(idx_np[b, t, k])
+                gw = float(gate_np[b, t, k])
+                expert_map[eid].append((b, t, k, gw))
 
-    # 3. Expert Fwd
+    # ==========================
+    # 3. Parallel Expert Forward
+    # ==========================
     merged_h = torch.zeros_like(h)
     tasks, eids = [], []
     for eid, items in expert_map.items():
@@ -270,31 +291,50 @@ async def process_micro_batch(
             metrics["dispatch_count"] += 1
             inst_id = inst.get("id")
             metrics["inst_choice_counts"][inst_id] += 1
+
             trace["exp_fwd"].append({"eid": eids[i][0], "inst": inst_id, "lat": lat})
+
+            # Merge results
             items = eids[i][1]
             for j, (b, t, k, gw) in enumerate(items):
                 merged_h[b, t] += gw * y_e[j]
-    else: merged_h = h
+    else:
+        merged_h = h
 
-    # 4. Post
-    post_resp, post_lat, post_inst = await call_post_fwd(client, tensor_to_pack(merged_h.cpu()), tensor_to_pack(y_mb), micro_id, tokens, 0, train)
+    # ==========================
+    # 4. Post Processing (Loss + Acc)
+    # ==========================
+    post_resp, post_lat, post_inst = await call_post_fwd(client, tensor_to_pack(merged_h.cpu()), tensor_to_pack(y_mb),
+                                                         micro_id, tokens, 0, train)
     metrics["post_lat"] += post_lat
+
+    # 记录基础指标
     metrics["loss"] = post_resp["loss"]
     metrics["acc_top1"] = post_resp.get("acc_top1", 0)
+
+    # [修复点 2] 关键：提取 Top-5 准确率，否则 run_step 里拿到的是 0
+    metrics["acc_top5"] = post_resp.get("acc_top5", 0)
+
     trace["post"] = post_inst.get("id")
 
-    # 5. Backward & Comm
+    # ==========================
+    # 5. Backward & Gradient Comm (Training Only)
+    # ==========================
     if train:
+        # A. Post -> Pre 反向传播
         t0 = time.perf_counter()
-        resp = await client.post(post_inst.get("url")+"/bwd", content=dumps({"grads": post_resp["grads"]}), headers={"Content-Type": "application/msgpack"})
-        metrics["post_bwd"] += (time.perf_counter()-t0)*1000
+        resp = await client.post(post_inst.get("url") + "/bwd", content=dumps({"grads": post_resp["grads"]}),
+                                 headers={"Content-Type": "application/msgpack"})
+        metrics["post_bwd"] += (time.perf_counter() - t0) * 1000
 
         rb = loads(resp.content)
         if "pre_grads" in rb:
-             t0 = time.perf_counter()
-             await client.post(pre_inst.get("url")+"/bwd", content=dumps({"grads": rb["pre_grads"]}), headers={"Content-Type": "application/msgpack"})
-             metrics["pre_bwd"] += (time.perf_counter()-t0)*1000
+            t0 = time.perf_counter()
+            await client.post(pre_inst.get("url") + "/bwd", content=dumps({"grads": rb["pre_grads"]}),
+                              headers={"Content-Type": "application/msgpack"})
+            metrics["pre_bwd"] += (time.perf_counter() - t0) * 1000
 
+        # B. Expert 梯度分发 (Hybrid Scheduling)
         if USE_NSGA2 and "expert_grads" in rb:
             grad_bytes = _est_grad_bytes(rb["expert_grads"])
             metrics["grad_bytes"] += grad_bytes
@@ -305,14 +345,24 @@ async def process_micro_batch(
                 insts = get_candidate_instances_for_func(func_grad)
                 if not insts: continue
 
+                # 判断是否为冷专家
                 is_cold_exp = eid in metrics["cold_experts"]
+
+                # [修复点 3] 统计遇到的冷专家总次数，作为 cold_skipped 的分母
+                if is_cold_exp:
+                    metrics["cold_total"] += 1
+
+                # 梯度累积策略：冷专家每 N 步才更新一次
                 if is_cold_exp and (micro_id % COLD_ACC_STEPS) != 0:
                     metrics["cold_skipped"] += 1
                     continue
 
+                # NSGA-II 模式选择
                 modes = feasible_modes()
-                if eid in metrics["hot_experts"]: modes = [m for m in modes if m in ("hot", "http")]
-                elif is_cold_exp: modes = [m for m in modes if m in ("cold", "http")]
+                if eid in metrics["hot_experts"]:
+                    modes = [m for m in modes if m in ("hot", "http")]
+                elif is_cold_exp:
+                    modes = [m for m in modes if m in ("cold", "http")]
 
                 req = {"grad_bytes": grad_bytes, "price_cents_s": DEFAULT_PRICE_CENTS_S}
                 choice = nsga2_select(insts, req, STEP_PERIOD_MS, modes=modes)
@@ -320,150 +370,215 @@ async def process_micro_batch(
                 if choice:
                     inst, mode = choice
                     cold_delay = await INSTANCE_MGR.check_and_warmup(inst)
+
                     url = inst.get("url").rstrip("/")
                     t0 = time.perf_counter()
 
-                    if mode == "hot": comm_manager.send_hot(eid_str, {eid_str: g_data})
-                    elif mode == "cold": comm_manager.send_cold(eid_str, {eid_str: g_data})
-                    else: await client.post(url+"/grad/apply", content=dumps({"grads": {eid_str: g_data}}), headers={"Content-Type": "application/msgpack"})
+                    # 执行通信
+                    if mode == "hot":
+                        comm_manager.send_hot(eid_str, {eid_str: g_data})
+                    elif mode == "cold":
+                        comm_manager.send_cold(eid_str, {eid_str: g_data})
+                    else:
+                        await client.post(url + "/grad/apply", content=dumps({"grads": {eid_str: g_data}}),
+                                          headers={"Content-Type": "application/msgpack"})
 
-                    lat = (time.perf_counter()-t0)*1000 + cold_delay
+                    lat = (time.perf_counter() - t0) * 1000 + cold_delay
+
+                    # 更新统计
                     metrics["expert_comm"] += lat
                     metrics["dispatch_count"] += 1
-                    metrics["mode_counts"][mode] += 1  # [关键] 记录模式选择
+                    metrics["mode_counts"][mode] += 1
                     inst_id = inst.get("id")
                     metrics["inst_choice_counts"][inst_id] += 1
+
                     trace["exp_bwd"].append({"eid": eid, "inst": inst.get("id"), "mode": mode, "lat": lat})
+
                     HYBRID_SCHED.update_stats(func_grad, eid, inst, req, lat)
 
     return {"metrics": metrics, "trace": trace}
 
 
-# ----------------- 7. 指标聚合 (Step级) -----------------
+# ----------------- 7. 指标聚合 (Clean Version: No Entropy) -----------------
 
 _metric_buffer = defaultdict(float)
 _metric_count = 0
 
-async def run_step(phase, batcher, global_step, metrics_logger):
+
+async def run_step(
+        phase: str,
+        batcher: LMTextBatcher,
+        global_step: int,
+        metrics_logger: MetricsLogger,
+) -> None:
     train = phase == "train"
     tokens = BATCH_SIZE * BLOCK_SIZE
+
+    # 1. 获取 Batch
     x, y = batcher.next_batch()
-    micro_bs = BATCH_SIZE // MICRO_BATCHES
+
+    micro_batches = MICRO_BATCHES
+    micro_bs = BATCH_SIZE // micro_batches
     comm = CommManager()
-    t_start = time.perf_counter()
+    t_step0 = time.perf_counter()
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         tasks = []
-        for m in range(MICRO_BATCHES):
-            x_mb = x[m*micro_bs : (m+1)*micro_bs]
-            y_mb = y[m*micro_bs : (m+1)*micro_bs]
-            tasks.append(process_micro_batch(client, comm, x_mb, y_mb, global_step*MICRO_BATCHES+m, m, global_step, tokens, train))
-
+        for m in range(micro_batches):
+            x_mb = x[m * micro_bs: (m + 1) * micro_bs]
+            y_mb = y[m * micro_bs: (m + 1) * micro_bs]
+            tasks.append(
+                process_micro_batch(
+                    client, comm, x_mb, y_mb,
+                    global_step * micro_batches + m, m, global_step, tokens, train
+                )
+            )
         results_wrapper = await asyncio.gather(*tasks)
 
+    # 2. 结果处理
     results = [r["metrics"] for r in results_wrapper]
-    if train: append_dispatch_log([r["trace"] for r in results_wrapper])
+    traces = [r["trace"] for r in results_wrapper]
 
-    # 1. 基础指标平均
+    if train:
+        append_dispatch_log(traces)
+
+    # 聚合当前 Step 的数据
     step_metrics = {
-        "loss": sum(r["loss"] for r in results) / MICRO_BATCHES,
-        "acc1": sum(r["acc_top1"] for r in results) / MICRO_BATCHES,
-        "pre_lat": sum(r["pre_lat"] for r in results) / MICRO_BATCHES,
-        "post_lat": sum(r["post_lat"] for r in results) / MICRO_BATCHES,
-        "pre_bwd": sum(r["pre_bwd"] for r in results) / MICRO_BATCHES,
-        "post_bwd": sum(r["post_bwd"] for r in results) / MICRO_BATCHES,
-        "exp_comm": sum(r["expert_comm"] for r in results) / MICRO_BATCHES,
+        "loss": sum(r["loss"] for r in results) / micro_batches,
+        "acc1": sum(r["acc_top1"] for r in results) / micro_batches,
+        "acc5": sum(r["acc_top5"] for r in results) / micro_batches,
+
+        "pre_lat": sum(r["pre_lat"] for r in results) / micro_batches,
+        "post_lat": sum(r["post_lat"] for r in results) / micro_batches,
+        "pre_bwd": sum(r["pre_bwd"] for r in results) / micro_batches,
+        "post_bwd": sum(r["post_bwd"] for r in results) / micro_batches,
+        "exp_comm": sum(r["expert_comm"] for r in results) / micro_batches,
+
         "grad_bytes": sum(r["grad_bytes"] for r in results),
         "disp_cnt": sum(r["dispatch_count"] for r in results),
-        "step_time": (time.perf_counter() - t_start) * 1000.0
+        "cold_total": sum(r["cold_total"] for r in results),
+        "cold_skipped": sum(r["cold_skipped"] for r in results),
     }
 
-    # 2. [关键修复] 高级指标聚合 (Hot/Cold Ratio)
-    # 合并所有微批次中出现的 hot/cold 专家集合
+    # 吞吐量计算
+    step_lat = (time.perf_counter() - t_step0) * 1000.0
+    safe_time_s = max(step_lat / 1000.0, 1e-6)
+    samples_per_s = BATCH_SIZE / safe_time_s
+    tokens_per_s = tokens / safe_time_s
+
+    # 高级指标计算
     all_hot = set().union(*[r["hot_experts"] for r in results])
     all_cold = set().union(*[r["cold_experts"] for r in results])
     total_experts_seen = len(all_hot) + len(all_cold)
+    hot_ratio = len(all_hot) / total_experts_seen if total_experts_seen > 0 else 0.0
 
-    step_metrics["hot_ratio"] = len(all_hot) / total_experts_seen if total_experts_seen > 0 else 0.0
-
-    # 聚合通信模式计数
     mode_counts_total = defaultdict(int)
     for r in results:
         for m, c in r["mode_counts"].items():
             mode_counts_total[m] += c
-
     total_modes = sum(mode_counts_total.values()) or 1
-    step_metrics["mode_hot_frac"] = mode_counts_total["hot"] / total_modes
-    step_metrics["mode_cold_frac"] = mode_counts_total["cold"] / total_modes
-    step_metrics["mode_http_frac"] = mode_counts_total["http"] / total_modes
 
+    # 3. 训练模式：累积并降频写入
     if train:
         async with httpx.AsyncClient(timeout=120.0) as client:
             for iid in PRE_STEP_INSTANCE_IDS | POST_STEP_INSTANCE_IDS:
                 if iid in INST_BY_ID:
-                    try: await client.post(INST_BY_ID[iid]["url"].rstrip("/")+"/step")
-                    except: pass
+                    try:
+                        await client.post(INST_BY_ID[iid]["url"].rstrip("/") + "/step")
+                    except:
+                        pass
 
         global _metric_buffer, _metric_count
+        _metric_buffer["step_time"] += step_lat
+        _metric_buffer["samples_per_s"] += samples_per_s
+        _metric_buffer["tokens_per_s"] += tokens_per_s
+
         for k, v in step_metrics.items():
             _metric_buffer[k] += v
+
         _metric_count += 1
 
         if _metric_count >= LOG_TRAIN_EVERY:
             avg = {k: v / _metric_count for k, v in _metric_buffer.items()}
+            cold_skip_ratio = avg["cold_skipped"] / avg["cold_total"] if avg["cold_total"] > 1e-6 else 0.0
 
-            log("controller", f"Step {global_step}: Loss={avg['loss']:.4f} Time={avg['step_time']:.1f}ms HotRatio={avg['hot_ratio']:.2f}")
-
-            # [关键修复] 将聚合后的 hot/cold 数据传入 StepMetrics
-            metrics_logger.log(StepMetrics(
-                step=global_step, phase="train",
+            avg_metrics = StepMetrics(
+                step=global_step,
+                phase="train",
                 loss=avg["loss"],
                 acc_top1=avg["acc1"],
-                acc_top5=0,
-                batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=tokens,
+                acc_top5=avg["acc5"],
+
+                batch_size=BATCH_SIZE,
+                seq_len=BLOCK_SIZE,
+                tokens=tokens,
+
+                step_time_ms=avg["step_time"],
                 pre_fwd_ms=avg["pre_lat"],
                 post_fwd_ms=avg["post_lat"],
                 post_bwd_ms=avg["post_bwd"],
                 pre_bwd_ms=avg["pre_bwd"],
-                step_time_ms=avg["step_time"],
                 expert_comm_ms=avg["exp_comm"],
+
+                samples_per_s=avg["samples_per_s"],
+                tokens_per_s=avg["tokens_per_s"],
+
                 grad_bytes=avg["grad_bytes"],
                 expert_inst_cnt=len(EXPERT_INSTANCE_IDS),
                 dispatch_count=avg["disp_cnt"],
-                # 填入计算出的平均值
-                hot_ratio=avg["hot_ratio"],
-                cold_skip_ratio=0, # 简化
-                mode_hot_frac=avg["mode_hot_frac"],
-                mode_cold_frac=avg["mode_cold_frac"],
-                mode_http_frac=avg["mode_http_frac"],
-                inst_entropy=0
-            ))
+
+                hot_ratio=hot_ratio,
+                cold_skip_ratio=cold_skip_ratio,
+
+                mode_hot_frac=mode_counts_total["hot"] / total_modes,
+                mode_cold_frac=mode_counts_total["cold"] / total_modes,
+                mode_http_frac=mode_counts_total["http"] / total_modes
+                # [已删除 inst_entropy]
+            )
+            metrics_logger.log(avg_metrics)
+            print(
+                f"[Step {global_step}] Loss: {avg['loss']:.4f} | Acc5: {avg['acc5']:.2f} | Speed: {avg['tokens_per_s']:.0f} tok/s")
 
             _metric_buffer = defaultdict(float)
             _metric_count = 0
+
+    # 验证模式：直接记录
     else:
-        metrics_logger.log(StepMetrics(
+        cold_skip_ratio = step_metrics["cold_skipped"] / step_metrics["cold_total"] if step_metrics[
+                                                                                           "cold_total"] > 0 else 0.0
+
+        val_metrics = StepMetrics(
             step=global_step, phase="val",
             loss=step_metrics["loss"],
             acc_top1=step_metrics["acc1"],
-            acc_top5=0,
+            acc_top5=step_metrics["acc5"],
+
             batch_size=BATCH_SIZE, seq_len=BLOCK_SIZE, tokens=tokens,
+            step_time_ms=step_lat,
+            samples_per_s=samples_per_s,
+            tokens_per_s=tokens_per_s,
+
             pre_fwd_ms=step_metrics["pre_lat"],
             post_fwd_ms=step_metrics["post_lat"],
             post_bwd_ms=step_metrics["post_bwd"],
             pre_bwd_ms=step_metrics["pre_bwd"],
-            step_time_ms=step_metrics["step_time"],
             expert_comm_ms=step_metrics["exp_comm"],
+
             grad_bytes=step_metrics["grad_bytes"],
             expert_inst_cnt=len(EXPERT_INSTANCE_IDS),
             dispatch_count=step_metrics["disp_cnt"],
-            hot_ratio=step_metrics["hot_ratio"],
-            cold_skip_ratio=0,
-            mode_hot_frac=step_metrics["mode_hot_frac"],
-            mode_cold_frac=step_metrics["mode_cold_frac"],
-            mode_http_frac=step_metrics["mode_http_frac"],
-            inst_entropy=0
-        ))
+
+            hot_ratio=hot_ratio,
+            cold_skip_ratio=cold_skip_ratio,
+
+            mode_hot_frac=mode_counts_total["hot"] / total_modes,
+            mode_cold_frac=mode_counts_total["cold"] / total_modes,
+            mode_http_frac=mode_counts_total["http"] / total_modes
+            # [已删除 inst_entropy]
+        )
+        metrics_logger.log(val_metrics)
+        print(f"[Step {global_step}] Val Loss: {step_metrics['loss']:.4f} Acc5: {step_metrics['acc5']:.2f}")
+
 
 async def main() -> None:
     log("controller", "Starting training controller")
