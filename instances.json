@@ -12,7 +12,8 @@
       "device": "cuda",
       "cold_start_ms": 100.0,
       "rtt_ms": 1.0,
-      "price_cents_s": 0.010
+      "price_cents_s": 0.010,
+      "performance": 2.5
     }
   },
   {
@@ -28,7 +29,8 @@
       "device": "cpu",
       "cold_start_ms": 50.0,
       "rtt_ms": 5.0,
-      "price_cents_s": 0.0005
+      "price_cents_s": 0.0005,
+      "performance": 0.5
     }
   },
   {
@@ -44,7 +46,8 @@
       "device": "cpu",
       "cold_start_ms": 300.0,
       "rtt_ms": 50.0,
-      "price_cents_s": 0.002
+      "price_cents_s": 0.002,
+      "performance": 1.5
     }
   },
 
@@ -61,7 +64,8 @@
       "device": "cuda",
       "cold_start_ms": 100.0,
       "rtt_ms": 1.2,
-      "price_cents_s": 0.010
+      "price_cents_s": 0.010,
+      "performance": 2.5
     }
   },
   {
@@ -77,7 +81,8 @@
       "device": "cpu",
       "cold_start_ms": 60.0,
       "rtt_ms": 6.0,
-      "price_cents_s": 0.0006
+      "price_cents_s": 0.0006,
+      "performance": 0.6
     }
   },
   {
@@ -93,7 +98,8 @@
       "device": "cpu",
       "cold_start_ms": 350.0,
       "rtt_ms": 55.0,
-      "price_cents_s": 0.0022
+      "price_cents_s": 0.0022,
+      "performance": 1.5
     }
   },
 
@@ -110,7 +116,8 @@
       "device": "cuda",
       "cold_start_ms": 200.0,
       "rtt_ms": 1.5,
-      "price_cents_s": 0.015
+      "price_cents_s": 0.015,
+      "performance": 3.0
     }
   },
   {
@@ -126,7 +133,8 @@
       "device": "cpu",
       "cold_start_ms": 80.0,
       "rtt_ms": 7.0,
-      "price_cents_s": 0.001
+      "price_cents_s": 0.001,
+      "performance": 0.8
     }
   },
   {
@@ -142,7 +150,8 @@
       "device": "cpu",
       "cold_start_ms": 500.0,
       "rtt_ms": 60.0,
-      "price_cents_s": 0.004
+      "price_cents_s": 0.004,
+      "performance": 1.5
     }
   },
 
@@ -159,7 +168,8 @@
       "device": "cuda",
       "cold_start_ms": 200.0,
       "rtt_ms": 1.8,
-      "price_cents_s": 0.015
+      "price_cents_s": 0.015,
+      "performance": 3.0
     }
   },
   {
@@ -175,7 +185,8 @@
       "device": "cpu",
       "cold_start_ms": 40.0,
       "rtt_ms": 8.0,
-      "price_cents_s": 0.0012
+      "price_cents_s": 0.0012,
+      "performance": 1.0
     }
   },
   {
@@ -191,7 +202,8 @@
       "device": "cpu",
       "cold_start_ms": 450.0,
       "rtt_ms": 65.0,
-      "price_cents_s": 0.0042
+      "price_cents_s": 0.0042,
+      "performance": 1.5
     }
   },
 
@@ -208,7 +220,8 @@
       "device": "cpu",
       "cold_start_ms": 90.0,
       "rtt_ms": 6.0,
-      "price_cents_s": 0.001
+      "price_cents_s": 0.001,
+      "performance": 0.8
     }
   },
   {
@@ -224,7 +237,8 @@
       "device": "cpu",
       "cold_start_ms": 400.0,
       "rtt_ms": 70.0,
-      "price_cents_s": 0.003
+      "price_cents_s": 0.003,
+      "performance": 1.2
     }
   },
 
@@ -235,13 +249,13 @@
     "memory_mb": 2048,
     "cpu_cores": 2,
     "disk_mb": 512,
-    "region": "local-b",
-    "meta": {
+    "\n    \"meta\": {region": "local-b",
       "desc": "Expert 3 (CPU)",
       "device": "cpu",
       "cold_start_ms": 85.0,
       "rtt_ms": 5.5,
-      "price_cents_s": 0.001
+      "price_cents_s": 0.001,
+      "performance": 0.8
     }
   },
   {
@@ -257,7 +271,8 @@
       "device": "cpu",
       "cold_start_ms": 420.0,
       "rtt_ms": 75.0,
-      "price_cents_s": 0.003
+      "price_cents_s": 0.003,
+      "performance": 1.2
     }
   }
 ]
