@@ -20,6 +20,7 @@ class MoeConfig:
     d_model: int
     num_pre_layers: int
     num_post_layers: int
+    model_name: str = "make_moe"  # 新增
 
 # 默认 MoE 配置，后续调整超参时可以直接修改这里，无需设置环境变量
 DEFAULT_MOE_CONFIG = MoeConfig(

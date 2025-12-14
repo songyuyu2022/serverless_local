@@ -1,3 +1,4 @@
+# filename: expert_app.py
 import os
 import asyncio
 from typing import Dict, Any, List
@@ -11,9 +12,12 @@ from comm import CommManager
 from utils.logger import log
 from moe_config import load_moe_config
 
+# --- 引入模型适配器 ---
+from makeMoE import MakeMoEAdapter
+
 app = FastAPI()
 
-# 强制使用 CPU（本地模拟）
+# 强制使用 CPU (本地模拟)，如果要在 GPU 运行请改为 'cuda'
 device = "cpu"
 
 LOGICAL_EID = int(os.getenv("LOGICAL_EID", "0"))
@@ -25,50 +29,44 @@ GRAD_BATCH_SIZE = int(os.getenv("GRAD_BATCH_SIZE", "4"))
 PULL_INTERVAL_MS = int(os.getenv("PULL_INTERVAL_MS", "50"))
 
 
-class ExpertMLP(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, 4 * dim)
-        self.fc2 = nn.Linear(4 * dim, dim)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(x)
-        h = self.act(h)
-        h = self.fc2(h)
-        return h
-
-
 def init_expert() -> Dict[str, Any]:
     moe_cfg = load_moe_config()
-    dim = moe_cfg.d_model
+
+    # --- 动态加载模型逻辑 ---
+    if moe_cfg.model_name == "make_moe":
+        adapter = MakeMoEAdapter(moe_cfg)
+        # 创建特定 ID 的 Expert 实例
+        expert = adapter.create_expert_instance(LOGICAL_EID).to(device)
+    else:
+        # 这里预留给未来扩展其他模型
+        raise ValueError(f"Unknown model: {moe_cfg.model_name}")
+    # ----------------------
+
     lr = float(os.getenv("LR_EXPERT", os.getenv("LR", "1e-3")))
     weight_decay = float(os.getenv("WD_EXPERT", "0.0"))
 
-    expert = ExpertMLP(dim).to(device)
     optim = torch.optim.AdamW(expert.parameters(), lr=lr, weight_decay=weight_decay)
 
     log(
         "expert-app",
-        f"ExpertMLP init: dim={dim}, lr={lr}, wd={weight_decay}, "
-        f"LOGICAL_EID={LOGICAL_EID}, device={device}",
+        f"Init {moe_cfg.model_name} Expert-{LOGICAL_EID}: dim={moe_cfg.d_model}, lr={lr}, device={device}",
     )
 
     return {"model": expert, "optim": optim}
 
 
 _state = init_expert()
-expert_model: ExpertMLP = _state["model"]
+expert_model: nn.Module = _state["model"]
 expert_optim: torch.optim.Optimizer = _state["optim"]
 
 
 def apply_grads_to_expert(
-    expert_model: nn.Module,
-    grad_y: torch.Tensor,
-    x: torch.Tensor,
+        expert_model: nn.Module,
+        grad_y: torch.Tensor,
+        x: torch.Tensor,
 ) -> None:
     """
-    对 ExpertMLP 应用梯度：
+    对 Expert 应用梯度：
       - y = expert(x)
       - y.backward(grad_y)
     """
@@ -181,7 +179,7 @@ async def expert_apply_grad(req: Request) -> Response:
 @app.post("/step")
 async def expert_step() -> Response:
     """
-    显式 step 接口（当前实现中可选用）
+    显式 step 接口
     """
     expert_optim.step()
     expert_optim.zero_grad(set_to_none=True)
