@@ -264,7 +264,7 @@
     "runtime": "python3.8",
     "memory_mb": 4096,
     "cpu_cores": 8,
-    "disk_mb": 1024,
+     "disk_mb": 1024,
     "region": "remote-z",
     "meta": {
       "desc": "Expert 3 (Remote)",
