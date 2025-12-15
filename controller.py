@@ -211,27 +211,49 @@ def apply_performance_scaling(inst: Dict[str, Any], real_compute_time_ms: float,
 def simulate_traffic_skew(topk_idx: torch.Tensor, num_experts: int) -> torch.Tensor:
     """
     [Simulation] 模拟真实的长尾分布流量。
-    如果没有这个，随机模型的流量是均匀的，任何自适应算法都会失效（因为确实大家一样热）。
+    修复了维度不匹配的 IndexError (自动适配 2D/3D 输入)。
     """
     if num_experts <= 2: return topk_idx
 
-    batch, seq, k = topk_idx.shape
-    new_idx = topk_idx.clone()
+    # 1. 维度标准化：确保处理的是 3D 张量 [Batch, Seq, K]
+    # 如果输入是 2D [Batch, K] (丢失了 Seq 维度)，则临时升维处理
+    is_2d = topk_idx.ndim == 2
+    if is_2d:
+        # [Batch, K] -> [Batch, 1, K]
+        topk_idx_3d = topk_idx.unsqueeze(1)
+    elif topk_idx.ndim == 3:
+        topk_idx_3d = topk_idx
+    else:
+        # 如果是其他奇怪的维度，直接返回，避免报错
+        return topk_idx
 
-    # 模拟 Pattern:
-    # Expert 0, 1 是绝对热点 (80% 概率)
-    # Expert 2 是次热点 (10% 概率)
-    # 其他是冷门
-    rand_vals = torch.rand(batch, seq)
+    # 2. 获取实际形状 (基于 topk_idx_3d，而不是假设 64)
+    batch, seq, k = topk_idx_3d.shape
+    new_idx = topk_idx_3d.clone()
 
+    # 3. 生成掩码 (使用实际的 batch 和 seq，确保与 new_idx 维度完全一致)
+    # device=topk_idx.device 确保在 GPU 运行时不报错
+    rand_vals = torch.rand((batch, seq), device=topk_idx.device)
+
+    # 4. 应用偏斜逻辑
     mask_hot = rand_vals < 0.7
-    new_idx[mask_hot, 0] = 0
-    if k > 1: new_idx[mask_hot, 1] = 1
+
+    # 只有当 k 维度足够时才进行赋值，防止越界
+    if k >= 1:
+        new_idx[mask_hot, 0] = 0
+    if k >= 2:
+        new_idx[mask_hot, 1] = 1
 
     mask_warm = (rand_vals >= 0.7) & (rand_vals < 0.85)
-    new_idx[mask_warm, 0] = 2
+    if k >= 1:
+        new_idx[mask_warm, 0] = 2
+
+    # 5. 还原形状 (如果是 2D 进来的，就 2D 出去)
+    if is_2d:
+        return new_idx.squeeze(1)
 
     return new_idx
+
 
 async def process_micro_batch(
         x_mb: torch.Tensor,
