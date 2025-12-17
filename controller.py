@@ -618,7 +618,15 @@ async def process_micro_batch(
                     trace["grad"]["mode_counts"]["local"] += 1
                     continue
 
-                choice = nsga2_select(insts_grad, req_grad, STEP_PERIOD_MS, feasible_modes())
+                modes = feasible_modes()
+                choice = nsga2_select(
+                    insts_grad,
+                    req_grad,
+                    STEP_PERIOD_MS,
+                    pop_size=int(os.getenv("NSGA2_POP_SIZE", "30")),
+                    modes=modes,
+                )
+
                 if choice:
                     inst_g, mode = choice
                     lat_g = apply_performance_scaling(inst_g, 5.0, is_hot_task=is_hot)

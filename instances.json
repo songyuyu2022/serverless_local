@@ -243,21 +243,22 @@
   },
 
   {
-    "id": "fn_exp3_cpu_1",
-    "url": "http://127.0.0.1:8231",
-    "runtime": "python3.10",
-    "memory_mb": 2048,
-    "cpu_cores": 2,
-    "disk_mb": 512,
-    "\n    \"meta\": {region": "local-b",
-      "desc": "Expert 3 (CPU)",
-      "device": "cpu",
-      "cold_start_ms": 85.0,
-      "rtt_ms": 5.5,
-      "price_cents_s": 0.001,
-      "performance": 0.8
-    }
-  },
+  "id": "fn_exp3_cpu_1",
+  "url": "http://127.0.0.1:8231",
+  "runtime": "python3.10",
+  "memory_mb": 2048,
+  "cpu_cores": 2,
+  "disk_mb": 512,
+  "region": "local-b",
+  "meta": {
+    "desc": "Expert 3 (CPU)",
+    "device": "cpu",
+    "cold_start_ms": 85.0,
+    "rtt_ms": 5.5,
+    "price_cents_s": 0.001,
+    "performance": 0.8
+  }
+},
   {
     "id": "fn_exp3_remote_1",
     "url": "http://127.0.0.1:8232",
