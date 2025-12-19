@@ -127,12 +127,34 @@ uvicorn expert_app:app --host 127.0.0.1 --port 8232
 # 7. 启动 Controller
 # ============================================
 Start-Window -command @"
-`$env:TOP_K='2'; `$env:NUM_EXPERTS='4';  # 4个专家选2个 -> 50% 激活率
-`$env:BATCH_SIZE='8'; `$env:BLOCK_SIZE='64'; # Batch Size 调小点，因为进程多了
+`$env:TOP_K='2'; `$env:NUM_EXPERTS='4';  # 给 pre_fn 用
+`$env:VOCAB_SIZE='2000';                # 建议同步 controller vocab，避免口径不一致
+`$env:EMB_DIM='256';                    # 建议同步（若 controller 读 MOE_CONFIG.d_model 也行）
+
+`$env:BATCH_SIZE='8'; `$env:BLOCK_SIZE='64';
 `$env:MAX_STEPS='500'; `$env:VAL_INTERVAL='100'; `$env:LOG_TRAIN_EVERY='10';
+
 `$env:MICRO_BATCHES='4';
+`$env:PARALLEL_DEGREE='4';              # ✅ 新增：并行度控制（关键）
+`$env:OVERFLOW_DROP='1';                # 可选：保证 overflow 指标有意义
+`$env:CAPACITY_FACTOR='1.25';           # 可选：论文常用
+
+`$env:PARALLEL_DEGREE='4';
+`$env:HOTSPOT_DRIFT_EVERY='100';
+`$env:HOTSPOT_SPAN='2';
+`$env:CAPACITY_FACTOR='2.0';
+
+`$env:HOTSPOT_DRIFT_EVERY='50';
+`$env:ALPHA_SHORT='0.45';
+`$env:HOT_HIGH_MUL='1.25';
+`$env:HOT_LOW_MUL='0.80';
+`$env:COLD_ACC_STEPS='2';
+`$env:CAPACITY_FACTOR='2.0';
+`$env:PARALLEL_DEGREE='4';
+
 python controller.py
 "@
+
 
 Write-Host ">>> All services started!"
 Write-Host ">>> Experts: 0, 1, 2, 3 (Total 4 logical experts)"
