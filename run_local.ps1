@@ -144,7 +144,7 @@ Start-Window -command @"
 `$env:HOTSPOT_SPAN='2';
 `$env:CAPACITY_FACTOR='2.0';
 
-`$env:HOTSPOT_DRIFT_EVERY='50';
+`$env:HOTSPOT_DRIFT_EVERY='20';
 `$env:ALPHA_SHORT='0.45';
 `$env:HOT_HIGH_MUL='1.25';
 `$env:HOT_LOW_MUL='0.80';

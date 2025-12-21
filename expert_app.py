@@ -1,4 +1,14 @@
-# filename: expert_app.py
+# expert_app.py
+"""
+Serverless Expert Function (makeMoE-free, moe_model-based)
+
+特性：
+- ❌ 不再依赖 makeMoE
+- ✅ 直接复用 moe_model.build_expert（结构唯一来源）
+- ✅ 单 expert / 单职责 / 可独立部署
+- ✅ 支持 forward + gradient apply（HTTP + hot/cold 通道）
+"""
+
 import os
 import asyncio
 from typing import Dict, Any, List
@@ -11,109 +21,120 @@ from shared import dumps, loads, tensor_to_pack, pack_to_tensor
 from comm import CommManager
 from utils.logger import log
 from moe_config import load_moe_config
+from moe_model import build_expert   # ⭐ 关键：直接复用 moe_model
 
-# --- 引入模型适配器 ---
-from makeMoE import MakeMoEAdapter
-
+# ----------------------------------------------------------------------
+# 基本配置
+# ----------------------------------------------------------------------
 app = FastAPI()
 
-# 强制使用 CPU (本地模拟)，如果要在 GPU 运行请改为 'cuda'
-device = "cpu"
+DEVICE = os.getenv("DEVICE", "cpu")
+device = torch.device(DEVICE)
 
 LOGICAL_EID = int(os.getenv("LOGICAL_EID", "0"))
 
 COMM_SIM_DIR = os.getenv("COMM_SIM_DIR", "comm_sim")
 COMM = CommManager(COMM_SIM_DIR)
 
-GRAD_BATCH_SIZE = int(os.getenv("GRAD_BATCH_SIZE", "4"))
 PULL_INTERVAL_MS = int(os.getenv("PULL_INTERVAL_MS", "50"))
 
-
+# ----------------------------------------------------------------------
+# Expert 初始化（完全 makeMoE-free）
+# ----------------------------------------------------------------------
 def init_expert() -> Dict[str, Any]:
+    """
+    初始化单个 Expert：
+    - 结构来源：moe_model.build_expert
+    - 参数与 controller 中 SimpleMoE.experts[eid] 一致
+    """
     moe_cfg = load_moe_config()
 
-    # --- 动态加载模型逻辑 ---
-    if moe_cfg.model_name == "make_moe":
-        adapter = MakeMoEAdapter(moe_cfg)
-        # 创建特定 ID 的 Expert 实例
-        expert = adapter.create_expert_instance(LOGICAL_EID).to(device)
-    else:
-        # 这里预留给未来扩展其他模型
-        raise ValueError(f"Unknown model: {moe_cfg.model_name}")
-    # ----------------------
+    d_model = int(getattr(moe_cfg, "d_model", 256))
+    hidden_mult = int(os.getenv("EXPERT_HIDDEN_MULT", "2"))   # 与 SimpleMoE 默认一致
+    act = os.getenv("EXPERT_ACT", "relu")
+
+    expert = build_expert(
+        d_model=d_model,
+        hidden_mult=hidden_mult,
+        act=act,
+    ).to(device)
 
     lr = float(os.getenv("LR_EXPERT", os.getenv("LR", "1e-3")))
-    weight_decay = float(os.getenv("WD_EXPERT", "0.0"))
+    wd = float(os.getenv("WD_EXPERT", "0.0"))
 
-    optim = torch.optim.AdamW(expert.parameters(), lr=lr, weight_decay=weight_decay)
+    optim = torch.optim.AdamW(
+        expert.parameters(),
+        lr=lr,
+        weight_decay=wd,
+    )
 
     log(
         "expert-app",
-        f"Init {moe_cfg.model_name} Expert-{LOGICAL_EID}: dim={moe_cfg.d_model}, lr={lr}, device={device}",
+        f"Init Expert-{LOGICAL_EID}: "
+        f"d_model={d_model}, hidden_mult={hidden_mult}, act={act}, "
+        f"lr={lr}, device={device}",
     )
 
-    return {"model": expert, "optim": optim}
+    return {
+        "model": expert,
+        "optim": optim,
+    }
 
 
-_state = init_expert()
-expert_model: nn.Module = _state["model"]
-expert_optim: torch.optim.Optimizer = _state["optim"]
+_STATE = init_expert()
+expert_model: nn.Module = _STATE["model"]
+expert_optim: torch.optim.Optimizer = _STATE["optim"]
 
-
+# ----------------------------------------------------------------------
+# 梯度应用逻辑
+# ----------------------------------------------------------------------
 def apply_grads_to_expert(
-        expert_model: nn.Module,
-        grad_y: torch.Tensor,
-        x: torch.Tensor,
-) -> None:
+    model: nn.Module,
+    grad_y: torch.Tensor,
+    x: torch.Tensor,
+):
     """
     对 Expert 应用梯度：
-      - y = expert(x)
-      - y.backward(grad_y)
+      y = expert(x)
+      y.backward(grad_y)
+      optimizer.step()
     """
-    expert_model.train()
+    model.train()
     expert_optim.zero_grad(set_to_none=True)
 
-    x_clone = x.detach().clone().requires_grad_(True)
-    y = expert_model(x_clone)
+    x = x.detach().clone().requires_grad_(True)
+    y = model(x)
     y.backward(grad_y)
 
     expert_optim.step()
 
 
+# ----------------------------------------------------------------------
+# 后台：从 hot / cold 通道异步拉取梯度
+# ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
     async def background_grad_worker():
         """
-        从 hot/cold 通道拉取梯度，做异步大 batch 更新。
-        梯度包约定：
-          {
-            "grad": packed_tensor,
-            "x": packed_tensor
-          }
+        模拟 serverless 场景：
+        - hot 通道：频繁更新
+        - cold 通道：延迟 / 累积更新
         """
         while True:
             try:
-                hot_grad = COMM.pull_hot(LOGICAL_EID) or []
-                cold_grad = COMM.pull_cold(LOGICAL_EID) or []
+                hot_grads = COMM.pull_hot(LOGICAL_EID) or []
+                cold_grads = COMM.pull_cold(LOGICAL_EID) or []
 
                 grads: List[torch.Tensor] = []
                 xs: List[torch.Tensor] = []
 
-                for g_pack in hot_grad:
-                    if g_pack is None:
+                for pack in hot_grads + cold_grads:
+                    if pack is None:
                         continue
-                    grad_tensor = pack_to_tensor(g_pack["grad"]).to(device)
-                    x_tensor = pack_to_tensor(g_pack["x"]).to(device)
-                    grads.append(grad_tensor)
-                    xs.append(x_tensor)
-
-                for g_pack in cold_grad:
-                    if g_pack is None:
-                        continue
-                    grad_tensor = pack_to_tensor(g_pack["grad"]).to(device)
-                    x_tensor = pack_to_tensor(g_pack["x"]).to(device)
-                    grads.append(grad_tensor)
-                    xs.append(x_tensor)
+                    grad = pack_to_tensor(pack["grad"]).to(device)
+                    x = pack_to_tensor(pack["x"]).to(device)
+                    grads.append(grad)
+                    xs.append(x)
 
                 if grads:
                     grad_cat = torch.cat(grads, dim=0)
@@ -128,11 +149,15 @@ async def startup_event():
     asyncio.create_task(background_grad_worker())
 
 
+# ----------------------------------------------------------------------
+# HTTP 接口：Expert Forward
+# ----------------------------------------------------------------------
 @app.post("/fwd")
 async def expert_forward(req: Request) -> Response:
     """
+    Forward 接口
     输入:
-      {"x": packed_tensor(N,D)}
+      {"x": packed_tensor(N,D)}  或 {"h": ...}
     输出:
       {"y": packed_tensor(N,D)}
     """
@@ -156,15 +181,15 @@ async def expert_forward(req: Request) -> Response:
     return Response(content=dumps(out), media_type="application/octet-stream")
 
 
+# ----------------------------------------------------------------------
+# HTTP 接口：同步梯度应用（兼容路径）
+# ----------------------------------------------------------------------
 @app.post("/grad/apply")
 async def expert_apply_grad(req: Request) -> Response:
     """
-    直接通过 HTTP 形式同步应用梯度
+    同步梯度应用接口
     payload:
-      {
-        "x": packed_tensor(N,D),
-        "grad_y": packed_tensor(N,D)
-      }
+      {"x": packed_tensor(N,D), "grad_y": packed_tensor(N,D)}
     """
     body = await req.body()
     obj = loads(body)
@@ -176,11 +201,11 @@ async def expert_apply_grad(req: Request) -> Response:
     return Response(content=dumps({"ok": True}), media_type="application/octet-stream")
 
 
+# ----------------------------------------------------------------------
+# 可选接口：显式 step（兼容旧路径）
+# ----------------------------------------------------------------------
 @app.post("/step")
 async def expert_step() -> Response:
-    """
-    显式 step 接口
-    """
     expert_optim.step()
     expert_optim.zero_grad(set_to_none=True)
     return Response(content=dumps({"ok": True}), media_type="application/octet-stream")

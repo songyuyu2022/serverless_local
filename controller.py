@@ -1,19 +1,15 @@
 # controller.py
 """
-训练控制器 (ICWS Edition) - TRUE MoE Version (Two-Optimizer, Hot/Cold Update + Capacity)
-[ICWS Strong Metrics Version]
-- 每 step 记录真实值（metrics.csv 每 step 一行）
-- 指标增强（论文友好）：
-  1) Forward/Backward 分离记录：
-     - fwd：按专家次数 hot/cold/local 分布 + 按 token 流量 hot/cold/local 分布
-     - bwd：pre_bwd_ms / post_bwd_ms（模拟“反向阶段 serverless invocations”）
-     - grad：NSGA2 选择的通信 mode 分布（按次数）+ grad_inv_total/queue/cold/net/compute 分解
-  2) capacity/overflow：按 step token 口径算 capacity，避免 micro 并行导致 overflow 假高
-  3) Active Hot Ratio + Hot flip 动态（证明热/冷识别在变化）
-  4) 冷专家延迟更新强度：skip/update、apply_steps_avg、grad_scale_avg + cold_pending_steps_avg + cold_update_hit_cnt
+训练控制器 (ICWS Edition) - TRUE MoE Version + Strong Metrics (Final Polish)
 
-【建议环境变量（不用改代码先提升“论文现象”）】
-- HOTSPOT_DRIFT_EVERY=50
+本版重点修复：
+1) grad_mode 与真实执行脱钩：NSGA2 选中的 (inst, mode) 现在会被“强制执行”
+2) mode 真正影响 invoke 成本模型（hot/cold/http/local/fallback）
+3) backward inv breakdown 统一口径：即使没有 bwd 实例池，也给出可解释的 bwd_inv_*（不再全 0）
+4) 新增 grad_nsga2_feasible / grad_fallback_cnt（论文可解释）
+
+建议 env（提升动态/论文现象）：
+- HOTSPOT_DRIFT_EVERY=20~50
 - ALPHA_SHORT=0.45
 - HOT_HIGH_MUL=1.25
 - HOT_LOW_MUL=0.80
@@ -25,7 +21,6 @@ import os
 import asyncio
 import json
 import time
-import random
 from typing import Any, Dict, List, Set, Tuple
 from collections import defaultdict
 
@@ -33,18 +28,17 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-try:
-    from moe_model import SimpleMoE
-except ImportError:
-    print("[Critical] moe_model.py not found. Please create it first.")
-    SimpleMoE = None
-
 from dataset import LMTextBatcher, DATA_PATH_DEFAULT
 from nsga2_bw import nsga2_select, feasible_modes
 from scheduler_hybrid import HYBRID_SCHED
 from utils.logger import log
 from utils.metrics import MetricsLogger, StepMetrics
 from moe_config import load_moe_config
+
+try:
+    from moe_model import SimpleMoE
+except ImportError:
+    SimpleMoE = None
 
 
 # ----------------- 1) Config -----------------
@@ -55,39 +49,39 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "500"))
 VAL_INTERVAL = int(os.getenv("VAL_INTERVAL", "100"))
 LOG_TRAIN_EVERY = int(os.getenv("LOG_TRAIN_EVERY", "10"))
 
-# micro-batch 并行
 MICRO_BATCHES = int(os.getenv("MICRO_BATCHES", "4"))
 PARALLEL_DEGREE = int(os.getenv("PARALLEL_DEGREE", str(MICRO_BATCHES)))
 
-# MoE
 VOCAB_SIZE = int(os.getenv("VOCAB_SIZE", "2000"))
 LR = float(os.getenv("LR", "1e-3"))
 CAPACITY_FACTOR = float(os.getenv("CAPACITY_FACTOR", "2.0"))
 OVERFLOW_DROP = os.getenv("OVERFLOW_DROP", "1") == "1"
 
-# NSGA2 / comm
 USE_NSGA2 = os.getenv("USE_NSGA2", "1") == "1"
 STEP_PERIOD_MS = float(os.getenv("STEP_PERIOD_MS", "200.0"))
 INVOKE_RETRIES = int(os.getenv("INVOKE_RETRIES", "3"))
 
-# cold delayed update
 COLD_ACC_STEPS = int(os.getenv("COLD_ACC_STEPS", "2"))
 
-# traffic drift（让 hot/cold 真变化）
 HOTSPOT_DRIFT_EVERY = int(os.getenv("HOTSPOT_DRIFT_EVERY", "50"))
 HOTSPOT_SPAN = int(os.getenv("HOTSPOT_SPAN", "2"))
 HOT_PROB = float(os.getenv("HOT_PROB", "0.70"))
 WARM_PROB = float(os.getenv("WARM_PROB", "0.15"))
 
-# bwd 模拟系数（让 bwd 有稳定可解释的量级）
 BWD_MULT_PRE = float(os.getenv("BWD_MULT_PRE", "2.0"))
 BWD_MULT_POST = float(os.getenv("BWD_MULT_POST", "2.0"))
-GRAD_BASE_MS = float(os.getenv("GRAD_BASE_MS", "8.0"))  # apply_grad 的“基础计算量”模拟
+GRAD_BASE_MS = float(os.getenv("GRAD_BASE_MS", "8.0"))
 
 DEFAULT_NET_LATENCY = float(os.getenv("DEFAULT_NET_LATENCY_MS", "5.0"))
 DEFAULT_PERFORMANCE = float(os.getenv("DEFAULT_PERFORMANCE", "1.0"))
 
-# resource pool
+# mode -> cost model（关键：让 mode 真实影响成本）
+HOT_NET_MUL = float(os.getenv("HOT_NET_MUL", "0.5"))      # 模拟 Redis 更快
+COLD_NET_MUL = float(os.getenv("COLD_NET_MUL", "2.0"))    # 模拟 OSS 更慢
+HTTP_NET_MUL = float(os.getenv("HTTP_NET_MUL", "1.0"))    # 常规 HTTP
+COLD_STORAGE_MS = float(os.getenv("COLD_STORAGE_MS", "20.0"))  # cold 额外存储交互开销
+FALLBACK_NET_MUL = float(os.getenv("FALLBACK_NET_MUL", "1.3")) # fallback 更差一点
+
 INSTANCES_FILE = os.getenv("INSTANCES_FILE", "instances.json")
 FUNC_MAP_FILE = os.getenv("FUNC_MAP_FILE", "func_map.json")
 DISPATCH_LOG_FILE = os.getenv("DISPATCH_LOG_FILE", "dispatch_trace.jsonl")
@@ -125,7 +119,7 @@ def append_dispatch_log(traces: List[Dict[str, Any]]):
         pass
 
 
-# ----------------- 3) Hot/Cold Heatmap (Adaptive Hysteresis) -----------------
+# ----------------- 3) Hot/Cold Heatmap -----------------
 class AdaptiveHysteresisHeatmap:
     def __init__(
         self,
@@ -136,7 +130,6 @@ class AdaptiveHysteresisHeatmap:
         low_mul: float,
         trend_discount: float = 0.80,
         eps: float = 1e-9,
-        baseline_floor: float = None,
     ):
         self.num_experts = num_experts
         self.alpha_short = alpha_short
@@ -149,8 +142,6 @@ class AdaptiveHysteresisHeatmap:
         self.short = torch.zeros(num_experts)
         self.long = torch.zeros(num_experts)
         self.is_hot_state = [False] * num_experts
-
-        self.baseline_floor = baseline_floor
         self._flip_accum = 0
 
     @torch.no_grad()
@@ -173,29 +164,22 @@ class AdaptiveHysteresisHeatmap:
         self.short = self.alpha_short * load + (1.0 - self.alpha_short) * self.short
         self.long = self.alpha_long * load + (1.0 - self.alpha_long) * self.long
 
-        base = self.baseline_floor
-        if base is None:
-            base = 1.0 / max(1, self.num_experts)
-
+        base = 1.0 / max(1, self.num_experts)
         flips = 0
         for e in range(self.num_experts):
             s = float(self.short[e].item())
-            l = float(self.long[e].item())
+            l = max(float(self.long[e].item()), base)
 
-            l_eff = max(l, base)
-            high_th = max(self.eps, l_eff * self.high_mul)
-            low_th = max(self.eps, l_eff * self.low_mul)
-
+            high_th = max(self.eps, l * self.high_mul)
+            low_th = max(self.eps, l * self.low_mul)
             if s > l:
                 high_th *= self.trend_discount
 
             prev = self.is_hot_state[e]
-            if not prev:
-                if s >= high_th:
-                    self.is_hot_state[e] = True
-            else:
-                if s <= low_th:
-                    self.is_hot_state[e] = False
+            if not prev and s >= high_th:
+                self.is_hot_state[e] = True
+            elif prev and s <= low_th:
+                self.is_hot_state[e] = False
 
             if self.is_hot_state[e] != prev:
                 flips += 1
@@ -211,9 +195,7 @@ class AdaptiveHysteresisHeatmap:
         return self.is_hot_state[eid]
 
     def hot_ratio(self) -> float:
-        if self.num_experts <= 0:
-            return 0.0
-        return sum(1 for x in self.is_hot_state if x) / float(self.num_experts)
+        return sum(1 for x in self.is_hot_state if x) / float(max(1, self.num_experts))
 
 
 HEATMAP: AdaptiveHysteresisHeatmap = None
@@ -233,17 +215,17 @@ class InstanceManager:
         inst_id = inst.get("id")
         now = time.perf_counter() * 1000.0
         last = self.last_access.get(inst_id)
+        cold_ms = float(inst.get("meta", {}).get("cold_start_ms", 100.0))
         if last is None:
-            return float(inst.get("meta", {}).get("cold_start_ms", 100.0))
+            return cold_ms
         if (now - last) > self.default_keep_alive_ms:
-            return float(inst.get("meta", {}).get("cold_start_ms", 100.0))
+            return cold_ms
         return 0.0
 
 
 INSTANCE_MGR = InstanceManager()
 INSTANCE_LOCK = asyncio.Lock()
 
-# 简单的“并发->排队”模拟：每个实例一个 semaphore
 INSTANCE_SEM: Dict[str, asyncio.Semaphore] = {}
 INSTANCE_MAX_CONC_DEFAULT = int(os.getenv("INSTANCE_MAX_CONC_DEFAULT", "1"))
 
@@ -252,7 +234,6 @@ def _get_inst_max_conc(inst: Dict[str, Any]) -> int:
     meta = inst.get("meta", {}) or {}
     mc = meta.get("max_concurrency", None)
     if mc is None:
-        # fallback：用 cpu_cores
         cpu = meta.get("cpu_cores", 1)
         try:
             mc = int(cpu)
@@ -268,35 +249,52 @@ def _get_inst_sem(inst: Dict[str, Any]) -> asyncio.Semaphore:
     return INSTANCE_SEM[iid]
 
 
+def _mode_net_multiplier(mode: str) -> float:
+    m = (mode or "").lower()
+    if m == "hot":
+        return HOT_NET_MUL
+    if m == "cold":
+        return COLD_NET_MUL
+    if m == "http":
+        return HTTP_NET_MUL
+    if m == "fallback":
+        return FALLBACK_NET_MUL
+    return HTTP_NET_MUL
+
+
 async def simulate_invoke_with_breakdown(
     inst: Dict[str, Any],
     base_compute_ms: float,
     *,
-    is_hot_task: bool,
+    mode: str,
 ) -> Tuple[float, float, float, float, float]:
     """
     返回 (total, queue, cold, net, compute)
+    mode 将影响 net（hot更快/cold更慢/fallback更差）并对 cold 增加 storage 额外开销
     """
     meta = inst.get("meta", {}) or {}
-
     perf = float(meta.get("performance", DEFAULT_PERFORMANCE) or DEFAULT_PERFORMANCE)
     compute_ms = float(base_compute_ms) / max(perf, 1e-6)
 
-    net_ms = float(meta.get("net_latency", DEFAULT_NET_LATENCY) or DEFAULT_NET_LATENCY)
+    base_net_ms = float(meta.get("net_latency", DEFAULT_NET_LATENCY) or DEFAULT_NET_LATENCY)
+    net_ms = base_net_ms * _mode_net_multiplier(mode)
+
+    extra_ms = 0.0
+    if (mode or "").lower() == "cold":
+        extra_ms += COLD_STORAGE_MS
 
     async with INSTANCE_LOCK:
         cold_ms = float(INSTANCE_MGR.check_cold_start(inst))
         INSTANCE_MGR.touch(inst.get("id"))
 
-    # queue
     sem = _get_inst_sem(inst)
     t0 = time.perf_counter()
     await sem.acquire()
     queue_ms = (time.perf_counter() - t0) * 1000.0
     try:
-        total_ms = queue_ms + cold_ms + net_ms + compute_ms
+        total_ms = queue_ms + cold_ms + net_ms + compute_ms + extra_ms
         await asyncio.sleep(total_ms / 1000.0)
-        return float(total_ms), float(queue_ms), float(cold_ms), float(net_ms), float(compute_ms)
+        return float(total_ms), float(queue_ms), float(cold_ms), float(net_ms + extra_ms), float(compute_ms)
     finally:
         sem.release()
 
@@ -308,21 +306,33 @@ async def invoke_with_retry(
     req: Dict[str, Any],
     base_compute_ms: float,
     *,
-    is_hot_task: bool,
+    mode: str,
     max_tries: int,
+    forced_inst: Dict[str, Any] = None,
 ) -> Tuple[Dict[str, Any], Tuple[float, float, float, float, float], int]:
     """
     返回 (inst, (total,queue,cold,net,compute), retry_cnt)
+    forced_inst: 用于 NSGA2 已选定实例时，避免二次选择（关键修复）
     """
-    cand = list(candidates)
     tries = 0
     last_err = None
 
+    # 如果提供了 forced_inst，直接尝试它（失败再退回 candidates）
+    if forced_inst is not None:
+        try:
+            breakdown = await simulate_invoke_with_breakdown(forced_inst, base_compute_ms, mode=mode)
+            retry_cnt = 0
+            HYBRID_SCHED.update_stats(func_name, logical_id, forced_inst, req, breakdown[0])
+            return forced_inst, breakdown, retry_cnt
+        except Exception as e:
+            last_err = e
+
+    cand = list(candidates)
     while tries < max_tries and cand:
         tries += 1
         inst, _ = HYBRID_SCHED.select_instance(func_name, logical_id, cand, req)
         try:
-            breakdown = await simulate_invoke_with_breakdown(inst, base_compute_ms, is_hot_task=is_hot_task)
+            breakdown = await simulate_invoke_with_breakdown(inst, base_compute_ms, mode=mode)
             retry_cnt = max(0, tries - 1)
             HYBRID_SCHED.update_stats(func_name, logical_id, inst, req, breakdown[0])
             return inst, breakdown, retry_cnt
@@ -334,16 +344,12 @@ async def invoke_with_retry(
     raise RuntimeError(f"invoke_with_retry failed: func={func_name} id={logical_id} err={last_err}")
 
 
-# ----------------- 5) Hotspot drift: make routing dynamic -----------------
+# ----------------- 5) Hotspot drift -----------------
 def simulate_traffic_skew(
     topk_idx: torch.Tensor,
     topk_vals: torch.Tensor,
     num_experts: int,
     global_step: int,
-    hot_prob: float,
-    warm_prob: float,
-    drift_every: int,
-    hot_span: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if num_experts <= 2:
         return topk_idx, topk_vals
@@ -359,17 +365,17 @@ def simulate_traffic_skew(
     B, T, K = topk_idx_3d.shape
     device = topk_idx_3d.device
 
-    phase = max(0, int(global_step // max(1, drift_every)))
-    hot0 = (phase * max(1, hot_span)) % num_experts
-    hot_set = [(hot0 + i) % num_experts for i in range(max(1, hot_span))]
-    warm_e = (hot0 + max(1, hot_span)) % num_experts
+    phase = max(0, int(global_step // max(1, HOTSPOT_DRIFT_EVERY)))
+    hot0 = (phase * max(1, HOTSPOT_SPAN)) % num_experts
+    hot_set = [(hot0 + i) % num_experts for i in range(max(1, HOTSPOT_SPAN))]
+    warm_e = (hot0 + max(1, HOTSPOT_SPAN)) % num_experts
 
     new_idx = topk_idx_3d.clone()
     new_vals = topk_vals_3d.clone()
 
     rand_vals = torch.rand((B, T), device=device)
-    mask_hot = rand_vals < hot_prob
-    mask_warm = (rand_vals >= hot_prob) & (rand_vals < hot_prob + warm_prob)
+    mask_hot = rand_vals < HOT_PROB
+    mask_warm = (rand_vals >= HOT_PROB) & (rand_vals < HOT_PROB + WARM_PROB)
 
     if K >= 1:
         t0 = new_idx[..., 0]
@@ -409,7 +415,7 @@ def simulate_traffic_skew(
     return new_idx, new_vals
 
 
-# ----------------- 6) TRUE MoE dispatch (capacity uses step token scale) -----------------
+# ----------------- 6) TRUE MoE dispatch -----------------
 async def moe_dispatch_and_compute_async(
     h: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -469,12 +475,12 @@ async def moe_dispatch_and_compute_async(
         x_e = flat_h[token_ids]
         w_e = flat_val[token_ids, k_ids].unsqueeze(-1)
 
-        # 真正的 expert 前向（本地算）
         t0 = time.perf_counter()
         y_e = REAL_MODEL.forward_single_expert(eid, x_e)
         real_exp_ms = (time.perf_counter() - t0) * 1000.0
 
         is_hot = HEATMAP.is_hot(eid) if HEATMAP else False
+        mode_key = "hot" if is_hot else "cold"
         req_exp = {"tokens": int(m), "emb_dim": D}
 
         if not insts_exp:
@@ -483,28 +489,19 @@ async def moe_dispatch_and_compute_async(
             metrics["mode_counts_expert"]["local"] += 1
             metrics["mode_counts_token"]["local"] += int(m)
 
-            trace["exp_fwd"].append({
-                "eid": eid, "inst": None, "hot": is_hot,
-                "tokens": int(m),
-                "final_ms": real_exp_ms,
-                "mode": "local",
-            })
+            trace["exp_fwd"].append({"eid": eid, "inst": None, "hot": is_hot, "tokens": int(m), "final_ms": real_exp_ms, "mode": "local"})
             combined.index_add_(0, token_ids, y_e * w_e)
             continue
 
-        # hot/cold 模式（这里将“无服务通信”只分类为 hot/cold/local；你若要 http 也能加）
-        mode_key = "hot" if is_hot else "cold"
-
         inst_exp, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
             func_exp, eid, insts_exp, req_exp, real_exp_ms,
-            is_hot_task=is_hot,
+            mode=mode_key,
             max_tries=INVOKE_RETRIES,
         )
 
         metrics["dispatch_count"] += 1
         metrics["expert_comm"] += tot
 
-        # forward invoke 分解
         metrics["inv_total_ms"] += tot
         metrics["inv_queue_ms"] += q
         metrics["inv_cold_ms"] += cold
@@ -516,23 +513,19 @@ async def moe_dispatch_and_compute_async(
         metrics["mode_counts_token"][mode_key] += int(m)
 
         trace["exp_fwd"].append({
-            "eid": eid, "inst": inst_exp.get("id"), "hot": is_hot,
-            "tokens": int(m),
-            "final_ms": tot,
-            "queue_ms": q, "cold_ms": cold, "net_ms": net, "compute_ms": comp,
-            "retry": int(retry_cnt),
-            "mode": mode_key,
+            "eid": eid, "inst": inst_exp.get("id"), "hot": is_hot, "tokens": int(m),
+            "final_ms": tot, "queue_ms": q, "cold_ms": cold, "net_ms": net, "compute_ms": comp,
+            "retry": int(retry_cnt), "mode": mode_key,
         })
 
         combined.index_add_(0, token_ids, y_e * w_e)
 
     metrics["overflow_total_assignments"] += int(overflow_total_assign)
     metrics["overflow_dropped_assignments"] += int(overflow_dropped)
-
     return combined.reshape(B, T, D)
 
 
-# ----------------- 7) Micro-batch forward (returns loss_tensor; bwd simulated in step) -----------------
+# ----------------- 7) Micro-batch forward -----------------
 async def process_micro_batch(
     x_mb: torch.Tensor,
     y_mb: torch.Tensor,
@@ -547,21 +540,15 @@ async def process_micro_batch(
     metrics = defaultdict(float, {
         "hot_experts": set(),
         "cold_experts": set(),
-
         "mode_counts_expert": defaultdict(int),
         "mode_counts_token": defaultdict(int),
-
         "dispatch_count": 0.0,
-
         "expert_comm": 0.0,
         "pre_lat": 0.0,
         "post_lat": 0.0,
-
         "capacity": 0,
         "overflow_total_assignments": 0,
         "overflow_dropped_assignments": 0,
-
-        # forward invoke breakdown
         "inv_total_ms": 0.0,
         "inv_queue_ms": 0.0,
         "inv_cold_ms": 0.0,
@@ -569,7 +556,6 @@ async def process_micro_batch(
         "inv_compute_ms": 0.0,
         "inv_retry_cnt": 0.0,
     })
-
     trace = {"step": global_step, "mb": mb_idx, "ts": time.time(), "exp_fwd": []}
 
     # --- Pre forward ---
@@ -581,14 +567,7 @@ async def process_micro_batch(
     h, topk_vals, topk_idx = REAL_MODEL.forward_pre(x_mb)
     real_pre_ms = (time.perf_counter() - t0) * 1000.0
 
-    # traffic drift -> make heatmap dynamic
-    topk_idx, topk_vals = simulate_traffic_skew(
-        topk_idx, topk_vals, MOE_CONFIG.num_experts,
-        global_step=global_step,
-        hot_prob=HOT_PROB, warm_prob=WARM_PROB,
-        drift_every=HOTSPOT_DRIFT_EVERY,
-        hot_span=HOTSPOT_SPAN,
-    )
+    topk_idx, topk_vals = simulate_traffic_skew(topk_idx, topk_vals, MOE_CONFIG.num_experts, global_step=global_step)
 
     if HEATMAP:
         async with HEATMAP_LOCK:
@@ -597,7 +576,7 @@ async def process_micro_batch(
     if insts_pre:
         inst_pre, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
             func_pre, 0, insts_pre, req_pre, real_pre_ms,
-            is_hot_task=True,
+            mode="http",
             max_tries=INVOKE_RETRIES,
         )
         metrics["pre_lat"] += tot
@@ -614,9 +593,7 @@ async def process_micro_batch(
     # --- Expert forward ---
     step_tokens_total = int(BATCH_SIZE * BLOCK_SIZE)
     combined_output = await moe_dispatch_and_compute_async(
-        h, topk_idx, topk_vals,
-        metrics, trace,
-        step_tokens_total=step_tokens_total,
+        h, topk_idx, topk_vals, metrics, trace, step_tokens_total=step_tokens_total
     )
 
     # --- Post forward + loss ---
@@ -640,7 +617,7 @@ async def process_micro_batch(
     if insts_post:
         inst_post, (tot, q, cold, net, comp), retry_cnt = await invoke_with_retry(
             func_post, 0, insts_post, req_post, real_post_ms,
-            is_hot_task=True,
+            mode="http",
             max_tries=INVOKE_RETRIES,
         )
         metrics["post_lat"] += tot
@@ -657,22 +634,19 @@ async def process_micro_batch(
     metrics["loss"] = float(loss_tensor.detach().item())
     metrics["acc_top1"] = float(acc1)
     metrics["acc_top5"] = float(acc5)
-
-    # 为 bwd 模拟保留 forward compute 量级（更稳定）
     metrics["real_pre_ms"] = float(real_pre_ms)
     metrics["real_post_ms"] = float(real_post_ms)
 
     return {"metrics": metrics, "trace": trace, "loss_tensor": loss_tensor}
 
 
-# ----------------- 8) Step runner: backward simulation + grad_inv breakdown -----------------
 _metric_buffer = defaultdict(float)
 _metric_count = 0
 
-# cold pending 统计用（每个 cold expert 当前 pending 了多少 step）
 _COLD_PENDING: Dict[int, int] = defaultdict(int)
 
 
+# ----------------- 8) Step runner -----------------
 async def run_step(
     phase: str,
     batcher: LMTextBatcher,
@@ -707,13 +681,7 @@ async def run_step(
             end = min((m + 1) * micro_bs, x.shape[0])
             if start >= end:
                 return None
-            return await process_micro_batch(
-                x_mb=x[start:end],
-                y_mb=y[start:end],
-                mb_idx=m,
-                global_step=global_step,
-                train=train,
-            )
+            return await process_micro_batch(x[start:end], y[start:end], m, global_step, train)
 
     t_start = time.perf_counter()
     micro_results = await asyncio.gather(*[_guarded_micro(m) for m in range(MICRO_BATCHES)])
@@ -725,7 +693,7 @@ async def run_step(
     if train:
         append_dispatch_log(traces)
 
-    # ---- (A) real autograd backward (optional) ----
+    # ---- (A) real autograd backward ----
     bwd_total_ms = 0.0
     if train:
         t0 = time.perf_counter()
@@ -737,8 +705,7 @@ async def run_step(
             total_loss.backward()
         bwd_total_ms = (time.perf_counter() - t0) * 1000.0
 
-    # ---- (B) simulate serverless bwd invocations: pre_bwd / post_bwd ----
-    # 目的：让 pre_bwd_ms/post_bwd_ms 不为 NaN，并且论文上可解释（“反向阶段也有 serverless 开销”）
+    # ---- (B) simulate serverless bwd invocations ----
     pre_bwd_ms = 0.0
     post_bwd_ms = 0.0
     bwd_inv_total_ms = 0.0
@@ -749,27 +716,26 @@ async def run_step(
     bwd_inv_retry_cnt = 0
 
     if train:
-        func_pre_bwd = "moe.pre_bwd"
-        func_post_bwd = "moe.post_bwd"
-        insts_pre_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_pre_bwd, []) if i in INST_BY_ID]
-        insts_post_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_post_bwd, []) if i in INST_BY_ID]
-
-        # 基于 forward compute 构造 bwd “计算量”
         avg_pre_real = sum(float(r.get("real_pre_ms", 0.0)) for r in results) / max(1, len(results))
         avg_post_real = sum(float(r.get("real_post_ms", 0.0)) for r in results) / max(1, len(results))
         base_pre_bwd = avg_pre_real * BWD_MULT_PRE
         base_post_bwd = avg_post_real * BWD_MULT_POST
 
+        func_pre_bwd = "moe.pre_bwd"
+        func_post_bwd = "moe.post_bwd"
+        insts_pre_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_pre_bwd, []) if i in INST_BY_ID]
+        insts_post_bwd = [INST_BY_ID[i] for i in FUNC_MAP.get(func_post_bwd, []) if i in INST_BY_ID]
+
         # pre_bwd
         if insts_pre_bwd:
-            inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
+            _, (tot, q, cold, net, comp), retry = await invoke_with_retry(
                 func_pre_bwd, 0, insts_pre_bwd,
                 {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "pre_bwd"},
                 base_pre_bwd,
-                is_hot_task=True,
+                mode="http",
                 max_tries=INVOKE_RETRIES,
             )
-            pre_bwd_ms += tot
+            pre_bwd_ms = tot
             bwd_inv_total_ms += tot
             bwd_inv_queue_ms += q
             bwd_inv_cold_ms += cold
@@ -777,19 +743,20 @@ async def run_step(
             bwd_inv_compute_ms += comp
             bwd_inv_retry_cnt += int(retry)
         else:
-            pre_bwd_ms += base_pre_bwd
+            # 本地也给出“inv 口径”，避免 bwd_inv 全 0
+            pre_bwd_ms = base_pre_bwd
             bwd_inv_compute_ms += base_pre_bwd
 
         # post_bwd
         if insts_post_bwd:
-            inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
+            _, (tot, q, cold, net, comp), retry = await invoke_with_retry(
                 func_post_bwd, 0, insts_post_bwd,
                 {"tokens": BATCH_SIZE * BLOCK_SIZE, "stage": "post_bwd"},
                 base_post_bwd,
-                is_hot_task=True,
+                mode="http",
                 max_tries=INVOKE_RETRIES,
             )
-            post_bwd_ms += tot
+            post_bwd_ms = tot
             bwd_inv_total_ms += tot
             bwd_inv_queue_ms += q
             bwd_inv_cold_ms += cold
@@ -797,10 +764,14 @@ async def run_step(
             bwd_inv_compute_ms += comp
             bwd_inv_retry_cnt += int(retry)
         else:
-            post_bwd_ms += base_post_bwd
+            post_bwd_ms = base_post_bwd
             bwd_inv_compute_ms += base_post_bwd
 
-    # ---- (C) grad apply + grad_inv breakdown ----
+        # ✅统一口径：即使没实例池，也让 total 有意义
+        if bwd_inv_total_ms <= 0.0:
+            bwd_inv_total_ms = float(pre_bwd_ms + post_bwd_ms)
+
+    # ---- (C) grad apply + grad_inv breakdown (NSGA2 forced-inst) ----
     grad_mode_counts = defaultdict(int)
     grad_total = 0
     grad_bytes = 0.0
@@ -812,6 +783,9 @@ async def run_step(
     grad_inv_compute_ms = 0.0
     grad_inv_retry_cnt = 0
 
+    grad_nsga2_feasible = 0
+    grad_fallback_cnt = 0
+
     if train and USE_NSGA2:
         grad_size = 1024 * 1024  # mock
         active_eids_set: Set[int] = set()
@@ -820,48 +794,44 @@ async def run_step(
                 if "eid" in t:
                     active_eids_set.add(int(t["eid"]))
 
-        modes = feasible_modes()
-
+        modes = feasible_modes()  # 你原 repo 的可行 modes
         for eid in sorted(active_eids_set):
             grad_total += 1
             grad_bytes += grad_size
 
             func_grad = f"moe.expert_apply_grad:{eid}"
             insts_grad = [INST_BY_ID[i] for i in FUNC_MAP.get(func_grad, []) if i in INST_BY_ID]
-            req_grad = {"grad_bytes": grad_size}
+            req_grad = {"grad_bytes": grad_size, "deadline_ms": STEP_PERIOD_MS}
 
             if not insts_grad:
                 grad_mode_counts["local"] += 1
-                # local 情况也给一个可比的 compute 量
                 grad_inv_compute_ms += GRAD_BASE_MS
                 continue
 
-            choice = nsga2_select(
-                insts_grad,
-                req_grad,
-                STEP_PERIOD_MS,
-                pop_size=int(os.getenv("NSGA2_POP_SIZE", "30")),
-                generations=int(os.getenv("NSGA2_GENS", "8")),
-                modes=modes,
-            )
-            if not choice:
-                grad_mode_counts["http"] += 1
-                # http fallback：用“等价 compute+net”粗略计
-                grad_inv_net_ms += DEFAULT_NET_LATENCY
-                grad_inv_compute_ms += GRAD_BASE_MS
-                continue
+            choice = nsga2_select(insts_grad, req_grad, STEP_PERIOD_MS, pop_size=int(os.getenv("NSGA2_POP_SIZE", "30")),
+                                 generations=int(os.getenv("NSGA2_GENS", "8")), modes=modes)
 
-            inst_g, mode = choice
-            grad_mode_counts[mode] += 1
+            if choice is None:
+                # ✅不再“都算 http”：记录为 fallback
+                grad_mode_counts["fallback"] += 1
+                grad_fallback_cnt += 1
+                mode = "fallback"
+                forced_inst = None
+            else:
+                grad_nsga2_feasible = 1
+                forced_inst, mode = choice
+                mode = (mode or "http").lower()
 
-            # 对 apply_grad 也做 “invoke breakdown”
+            # ✅关键修复：forced_inst 会被强制使用（不会二次被 scheduler 改掉）
             inst, (tot, q, cold, net, comp), retry = await invoke_with_retry(
                 func_grad, eid, insts_grad, req_grad,
                 base_compute_ms=GRAD_BASE_MS,
-                is_hot_task=(HEATMAP.is_hot(eid) if HEATMAP else False),
+                mode=mode,
                 max_tries=INVOKE_RETRIES,
+                forced_inst=forced_inst,
             )
 
+            grad_mode_counts[mode] += 1
             grad_inv_total_ms += tot
             grad_inv_queue_ms += q
             grad_inv_cold_ms += cold
@@ -875,16 +845,13 @@ async def run_step(
     cold_updated = 0
     cold_apply_steps_sum = 0.0
     cold_grad_scale_sum = 0.0
-
     cold_pending_steps_sum = 0.0
     cold_pending_cnt = 0
     cold_update_hit_cnt = 0
 
     if train:
-        # shared
         OPT_SHARED.step()
 
-        # decide which experts to update this step
         update_eids: Set[int] = set()
         for eid in range(MOE_CONFIG.num_experts):
             is_hot = HEATMAP.is_hot(eid) if HEATMAP else False
@@ -893,24 +860,18 @@ async def run_step(
                 update_eids.add(eid)
             else:
                 cold_total += 1
-                _COLD_PENDING[eid] += 1  # pending++
-
-                # pending strength metrics
+                _COLD_PENDING[eid] += 1
                 cold_pending_steps_sum += float(_COLD_PENDING[eid])
                 cold_pending_cnt += 1
 
-                # delayed update decision
                 if COLD_ACC_STEPS > 1 and (_COLD_PENDING[eid] % COLD_ACC_STEPS != 0):
                     cold_skipped += 1
                     continue
 
-                # we will update cold now
                 update_eids.add(eid)
                 cold_update_hit_cnt += 1
 
-        # expert update
         if update_eids:
-            # scale cold grads if accumulated
             for eid in update_eids:
                 if HEATMAP and (not HEATMAP.is_hot(eid)):
                     apply_steps = max(1, _COLD_PENDING[eid])
@@ -922,7 +883,6 @@ async def run_step(
                             if p.grad is not None:
                                 p.grad.mul_(1.0 / float(apply_steps))
 
-            # mask non-updated experts grads
             stashes: Dict[int, List[torch.Tensor]] = {}
             for eid, expert in enumerate(REAL_MODEL.experts):
                 if eid not in update_eids:
@@ -934,14 +894,12 @@ async def run_step(
 
             OPT_EXPERT.step()
 
-            # restore masked grads
             for eid, stash in stashes.items():
                 i = 0
                 for p in REAL_MODEL.experts[eid].parameters():
                     p.grad = stash[i]
                     i += 1
 
-            # clear & reset pending
             for eid in update_eids:
                 for p in REAL_MODEL.experts[eid].parameters():
                     p.grad = None
@@ -1040,15 +998,15 @@ async def run_step(
     current_cold_skip_ratio = (cold_skipped / cold_total) if cold_total > 0 else 0.0
     cold_apply_steps_avg = (cold_apply_steps_sum / cold_updated) if cold_updated > 0 else 0.0
     cold_grad_scale_avg = (cold_grad_scale_sum / cold_updated) if cold_updated > 0 else 0.0
-
     cold_pending_steps_avg = (cold_pending_steps_sum / cold_pending_cnt) if cold_pending_cnt > 0 else 0.0
 
+    # grad mode fracs（包含 fallback）
     grad_mode_hot_frac = grad_mode_counts.get("hot", 0) / max(1, grad_total)
     grad_mode_cold_frac = grad_mode_counts.get("cold", 0) / max(1, grad_total)
     grad_mode_http_frac = grad_mode_counts.get("http", 0) / max(1, grad_total)
     grad_mode_local_frac = grad_mode_counts.get("local", 0) / max(1, grad_total)
+    grad_mode_fallback_frac = grad_mode_counts.get("fallback", 0) / max(1, grad_total)
 
-    # --------- write CSV (方案A：每 step 真实值) ----------
     metrics_logger.log(StepMetrics(
         epoch=epoch,
         step=global_step,
@@ -1068,7 +1026,6 @@ async def run_step(
         post_fwd_ms=float(post_lat / n_mb),
         expert_comm_ms=float(exp_comm / n_mb),
 
-        # ✅补齐 bwd（不再 NaN）
         bwd_total_ms=float(bwd_total_ms),
         pre_bwd_ms=float(pre_bwd_ms),
         post_bwd_ms=float(post_bwd_ms),
@@ -1088,14 +1045,17 @@ async def run_step(
         grad_mode_cold_frac=float(grad_mode_cold_frac),
         grad_mode_http_frac=float(grad_mode_http_frac),
         grad_mode_local_frac=float(grad_mode_local_frac),
+        grad_mode_fallback_frac=float(grad_mode_fallback_frac),
 
-        # ✅补齐 grad invoke breakdown（不再 NaN）
         grad_inv_total_ms=float(grad_inv_total_ms),
         grad_inv_queue_ms=float(grad_inv_queue_ms),
         grad_inv_cold_ms=float(grad_inv_cold_ms),
         grad_inv_net_ms=float(grad_inv_net_ms),
         grad_inv_compute_ms=float(grad_inv_compute_ms),
         grad_inv_retry_cnt=int(grad_inv_retry_cnt),
+
+        grad_nsga2_feasible=int(grad_nsga2_feasible),
+        grad_fallback_cnt=int(grad_fallback_cnt),
 
         dispatch_count=int(dispatch_fwd),
         expert_inst_cnt=int(MOE_CONFIG.num_experts),
@@ -1111,8 +1071,6 @@ async def run_step(
         cold_skip_ratio=float(current_cold_skip_ratio),
         cold_apply_steps_avg=float(cold_apply_steps_avg),
         cold_grad_scale_avg=float(cold_grad_scale_avg),
-
-        # ✅新增：cold pending 强度（让 cold_skip_ratio 可解释）
         cold_pending_steps_avg=float(cold_pending_steps_avg),
         cold_update_hit_cnt=int(cold_update_hit_cnt),
 
@@ -1137,7 +1095,6 @@ async def run_step(
         inv_retry_cnt=int(inv_retry_cnt),
     ))
 
-    # 控制台打印（窗口平均）
     global _metric_buffer, _metric_count
     if train:
         _metric_buffer["loss"] += float(loss)
@@ -1153,9 +1110,7 @@ async def run_step(
                 f"Time(avg{LOG_TRAIN_EVERY}): {avg_time:.0f}ms | "
                 f"HotRatio: {current_hot_ratio:.2f} | ActiveHot: {active_hot_ratio:.2f} | Flip: {hot_flip_cnt} | "
                 f"OverflowDrop: {overflow_drop_ratio:.3f} | "
-                f"ColdSkip: {current_cold_skip_ratio:.2f} | ColdPendingAvg: {cold_pending_steps_avg:.2f} | "
-                f"GradInv(total/queue/cold/net/comp): "
-                f"{grad_inv_total_ms:.1f}/{grad_inv_queue_ms:.1f}/{grad_inv_cold_ms:.1f}/{grad_inv_net_ms:.1f}/{grad_inv_compute_ms:.1f}"
+                f"GradModes(h/c/http/local/fb): {grad_mode_hot_frac:.2f}/{grad_mode_cold_frac:.2f}/{grad_mode_http_frac:.2f}/{grad_mode_local_frac:.2f}/{grad_mode_fallback_frac:.2f}"
             )
             _metric_buffer = defaultdict(float)
             _metric_count = 0
@@ -1163,19 +1118,15 @@ async def run_step(
 
 # ----------------- 9) Main -----------------
 async def main():
-    log("controller", "Starting controller (ICWS Strong Metrics)...")
+    log("controller", "Starting controller (ICWS Strong Metrics - Final Polish)...")
 
     global REAL_MODEL, OPT_SHARED, OPT_EXPERT, HEATMAP
-
     if not SimpleMoE:
-        return
+        raise RuntimeError("moe_model.SimpleMoE not found")
 
     if MOE_CONFIG.top_k >= MOE_CONFIG.num_experts:
-        raise RuntimeError(
-            f"[ConfigError] top_k({MOE_CONFIG.top_k}) must be < num_experts({MOE_CONFIG.num_experts})."
-        )
+        raise RuntimeError(f"top_k({MOE_CONFIG.top_k}) must be < num_experts({MOE_CONFIG.num_experts})")
 
-    # build model
     REAL_MODEL = SimpleMoE(
         vocab_size=VOCAB_SIZE,
         d_model=MOE_CONFIG.d_model,
@@ -1183,7 +1134,6 @@ async def main():
         top_k=MOE_CONFIG.top_k,
     )
 
-    # two optimizer（shared + experts）
     shared_params = []
     for name in ["embed", "gate", "norm", "head", "lm_head"]:
         m = getattr(REAL_MODEL, name, None)
@@ -1196,7 +1146,6 @@ async def main():
     OPT_SHARED = optim.Adam(shared_params, lr=LR)
     OPT_EXPERT = optim.Adam(expert_params, lr=LR)
 
-    # heatmap sensitivity (env-tunable)
     alpha_short = float(os.getenv("ALPHA_SHORT", "0.45"))
     alpha_long = float(os.getenv("ALPHA_LONG", "0.05"))
     high_mul = float(os.getenv("HOT_HIGH_MUL", "1.25"))
@@ -1212,7 +1161,6 @@ async def main():
         trend_discount=trend_discount,
     )
 
-    # dataset
     train_batcher = LMTextBatcher(data_path=DATA_PATH, split="train", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
     val_batcher = LMTextBatcher(data_path=DATA_PATH, split="val", batch_size=BATCH_SIZE, block_size=BLOCK_SIZE)
 
@@ -1225,7 +1173,6 @@ async def main():
     while global_step < MAX_STEPS:
         await run_step("train", train_batcher, global_step, metrics_logger, steps_per_epoch)
         global_step += 1
-
         if global_step % VAL_INTERVAL == 0:
             await run_step("val", val_batcher, global_step, metrics_logger, steps_per_epoch)
 
