@@ -10,6 +10,17 @@
     "fn_post_3"
   ],
 
+  "moe.pre_bwd": [
+    "fn_pre_py_torch_gpu_1",
+    "fn_pre_py_torch_cpu_1",
+    "fn_pre_3"
+  ],
+  "moe.post_bwd": [
+    "fn_post_py_torch_gpu_1",
+    "fn_post_py_torch_cpu_1",
+    "fn_post_3"
+  ],
+
   "moe.expert_fwd:0": [
     "fn_exp0_py_torch_gpu_1",
     "fn_exp0_py_torch_cpu_1",

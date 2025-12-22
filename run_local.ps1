@@ -134,23 +134,30 @@ Start-Window -command @"
 `$env:BATCH_SIZE='8'; `$env:BLOCK_SIZE='64';
 `$env:MAX_STEPS='500'; `$env:VAL_INTERVAL='100'; `$env:LOG_TRAIN_EVERY='10';
 
-`$env:MICRO_BATCHES='4';
-`$env:PARALLEL_DEGREE='4';              # ✅ 新增：并行度控制（关键）
-`$env:OVERFLOW_DROP='1';                # 可选：保证 overflow 指标有意义
-`$env:CAPACITY_FACTOR='1.25';           # 可选：论文常用
+`$env:MICRO_BATCHES="4"
+`$env:PARALLEL_DEGREE="4"
 
-`$env:PARALLEL_DEGREE='4';
-`$env:HOTSPOT_DRIFT_EVERY='100';
-`$env:HOTSPOT_SPAN='2';
-`$env:CAPACITY_FACTOR='2.0';
+# 让冷热变化更明显（论文现象更清楚）
+`$env:HOTSPOT_DRIFT_EVERY="20"
+`$env:HOTSPOT_SPAN="3"
+`$env:HOT_PROB="0.80"
+`$env:WARM_PROB="0.10"
 
-`$env:HOTSPOT_DRIFT_EVERY='20';
-`$env:ALPHA_SHORT='0.45';
-`$env:HOT_HIGH_MUL='1.25';
-`$env:HOT_LOW_MUL='0.80';
-`$env:COLD_ACC_STEPS='2';
-`$env:CAPACITY_FACTOR='2.0';
-`$env:PARALLEL_DEGREE='4';
+# 让 grad_apply 出现 hot/cold/http 混合分布
+`$env:GRAD_HOT_PROB="0.85"
+`$env:GRAD_COLD_PROB="0.85"
+
+# 开启 autoscale（模拟平台弹性扩容，减少 queue）
+`$env:AUTOSCALE_ENABLE="1"
+`$env:AUTOSCALE_QUEUE_TH_MS="30"
+`$env:AUTOSCALE_MAX_REPLICA="6"
+`$env:AUTOSCALE_COOLDOWN_STEPS="8"
+
+# deadline 改为自适应（p95 * 1.1），避免全 miss
+`$env:DEADLINE_WARMUP_STEPS="30"
+`$env:DEADLINE_PCTL="95"
+`$env:DEADLINE_SAFETY="1.10"
+`$env:DEADLINE_MIN_MS="200"
 
 python controller.py
 "@
