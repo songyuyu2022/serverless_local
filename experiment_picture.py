@@ -1,13 +1,7 @@
 # picture.py
 # -*- coding: utf-8 -*-
 """
-Paper-ready minimal figures for ICWS (only the most important plots):
-  1) Val Loss/PPL vs Step
-  2) Acc@5 vs Step (ONLY acc_top5)
-  3) Grad Apply Mode Fractions (hot/cold/http)
-  4) Cost Breakdown (stacked)
-  5) Deadline Miss Rate + Slack
-
+Paper-ready minimal figures for ICWS (Improved Version).
 Run (PowerShell):
   python .\picture.py --csv .\metrics.csv --out_dir .\figures_icws --col 1 --smooth 10 --fmt pdf,png
 """
@@ -17,33 +11,38 @@ import argparse
 import math
 import numpy as np
 import pandas as pd
+import matplotlib as mlp
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 
 
 # -------------------------
 # Paper style
 # -------------------------
-def set_paper_style(font="Times New Roman", base_fontsize=8):
+def set_paper_style(font="Times New Roman", base_fontsize=10):
+    # Use a style that looks good in papers
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": [font, "Times New Roman", "Times", "DejaVu Serif"],
         "font.size": base_fontsize,
-        "axes.titlesize": base_fontsize,
+        "axes.titlesize": base_fontsize + 1,
         "axes.labelsize": base_fontsize,
-        "xtick.labelsize": base_fontsize,
-        "ytick.labelsize": base_fontsize,
-        "legend.fontsize": base_fontsize,
-        "figure.titlesize": base_fontsize,
-        "axes.linewidth": 0.6,
-        "xtick.major.width": 0.6,
-        "ytick.major.width": 0.6,
-        "lines.linewidth": 1.2,
-        "grid.linewidth": 0.3,
+        "xtick.labelsize": base_fontsize - 1,
+        "ytick.labelsize": base_fontsize - 1,
+        "legend.fontsize": base_fontsize - 1,
+        "figure.titlesize": base_fontsize + 2,
+        "axes.linewidth": 0.8,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "lines.linewidth": 1.5,
+        "grid.linewidth": 0.5,
         "grid.alpha": 0.5,
+        "grid.linestyle": "--",
+        "savefig.dpi": 300,
     })
 
 
-def fig_size(col=1, aspect=0.72):
+def fig_size(col=1, aspect=0.618):  # Golden ratio
     # IEEE two-column typical widths: single ~3.5", double ~7.16"
     w = 3.5 if col == 1 else 7.16
     h = w * aspect
@@ -94,6 +93,18 @@ def to_numeric(df: pd.DataFrame, cols):
 
 
 # -------------------------
+# Plots
+# -------------------------
+
+COLORS = {
+    'train': '#1f77b4',  # Blue
+    'val': '#ff7f0e',  # Orange
+    'loss': '#d62728',  # Red
+    'ppl': '#2ca02c',  # Green
+}
+
+
+# -------------------------
 # Plots (minimal set)
 # -------------------------
 def plot_val_loss_ppl(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf", "png")):
@@ -134,7 +145,6 @@ def plot_val_loss_ppl(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pd
 
 
 def plot_acc5_only(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf", "png")):
-    # ONLY acc_top5
     if "acc_top5" not in df.columns:
         print("[skip] acc@5: acc_top5 not found.")
         return
@@ -142,21 +152,33 @@ def plot_acc5_only(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf",
     train = get_phase(df, "train")
     val = get_phase(df, "val")
 
-    fig = plt.figure(figsize=fig_size(col, aspect=0.72))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=fig_size(col))
 
     if train is not None:
-        ax.plot(train[x], rolling_mean(train["acc_top5"], smooth), label="train-acc@5", linestyle="-")
+        # Plot smoothed training accuracy
+        ax.plot(train[x], rolling_mean(train["acc_top5"], smooth), color=COLORS['train'], label="Train Acc@5",
+                linewidth=1.5)
 
     if val is not None:
-        # val 通常点很少，用散点更清晰
-        ax.scatter(val[x], val["acc_top5"], label="val-acc@5", s=10, marker="o")
+        # Plot validation with markers and line
+        ax.plot(val[x], val["acc_top5"], color=COLORS['val'], label="Val Acc@5", marker="o", markersize=2,
+                linestyle="--", linewidth=1.5)
 
-    ax.set_xlabel(x)
-    ax.set_ylabel("Accuracy@5")
-    ax.set_title("Accuracy@5 vs Step")
-    ax.grid(True)
-    ax.legend(frameon=False, ncol=2)
+    ax.set_xlabel(x.capitalize())
+    ax.set_ylabel("Accuracy")
+
+    # Format y-axis as percentage
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+
+    # Set y-axis limits
+    ax.set_ylim(bottom=0.0)
+    max_val = df["acc_top5"].max()
+    if max_val < 0.9:
+        ax.set_ylim(top=1.0)
+
+    ax.set_title("Top-5 Accuracy")
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='lower right', frameon=True)
 
     save_fig(fig, out_dir, "acc5_vs_step", fmt=fmt, dpi=dpi)
 
@@ -164,33 +186,35 @@ def plot_acc5_only(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf",
 def plot_grad_mode_fractions(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf", "png")):
     train = fallback_train(df)
 
-    cols = [c for c in [
-        "grad_mode_hot_frac",
-        "grad_mode_cold_frac",
-        "grad_mode_http_frac",
-    ] if c in train.columns]
+    cols = ["grad_mode_hot_frac", "grad_mode_cold_frac", "grad_mode_http_frac"]
+    cols = [c for c in cols if c in train.columns]
 
     if not cols:
-        print("[skip] grad modes: grad_mode_* not found.")
         return
 
-    fig = plt.figure(figsize=fig_size(col, aspect=0.72))
-    ax = fig.add_subplot(111)
+    fig, ax = plt.subplots(figsize=fig_size(col))
 
     label_map = {
-        "grad_mode_hot_frac": "hot",
-        "grad_mode_cold_frac": "cold",
-        "grad_mode_http_frac": "http",
+        "grad_mode_hot_frac": "Hot",
+        "grad_mode_cold_frac": "Cold",
+        "grad_mode_http_frac": "HTTP",
     }
 
-    for c in cols:
-        ax.plot(train[x], rolling_mean(train[c], smooth), label=label_map.get(c, c))
+    xs = train[x]
+    ys = [rolling_mean(train[c], smooth) for c in cols]
+    labels = [label_map.get(c, c) for c in cols]
 
-    ax.set_xlabel(x)
+    stack_colors = [ '#ff7f0e', '#1f77b4', '#2ca02c']
+
+    ax.stackplot(xs, *ys, labels=labels, colors=stack_colors, alpha=0.8)
+
+    ax.set_xlabel(x.capitalize())
     ax.set_ylabel("Fraction")
-    ax.set_title("Grad Apply Mode Fractions vs Step")
-    ax.grid(True)
-    ax.legend(frameon=False, ncol=3)
+    ax.set_title("Gradient Apply Modes")
+    ax.set_ylim(0, 1)
+    ax.margins(0, 0)
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.legend(loc='center right', frameon=True, fontsize=8)
 
     save_fig(fig, out_dir, "grad_mode_fractions_vs_step", fmt=fmt, dpi=dpi)
 
@@ -199,45 +223,43 @@ def plot_cost_breakdown(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("
     train = fallback_train(df)
 
     comps = [
-        "cost_usd_pre_fwd",
-        "cost_usd_post_fwd",
-        "cost_usd_expert_fwd",
-        "cost_usd_pre_bwd",
-        "cost_usd_post_bwd",
-        "cost_usd_grad_apply",
+        "cost_usd_pre_fwd", "cost_usd_expert_fwd", "cost_usd_post_fwd",
+        "cost_usd_pre_bwd", "cost_usd_post_bwd", "cost_usd_grad_apply"
     ]
-    comps = [c for c in comps if c in train.columns]
 
-    if not comps:
-        print("[skip] cost breakdown: cost_usd_* components not found.")
+    comp_labels = [
+        "Pre-Fwd", "Expert Fwd", "Post-Fwd",
+        "Pre-Bwd", "Post-Bwd", "Grad Apply"
+    ]
+
+    existing_comps = []
+    existing_labels = []
+    for c, l in zip(comps, comp_labels):
+        if c in train.columns:
+            existing_comps.append(c)
+            existing_labels.append(l)
+
+    if not existing_comps:
         return
 
-    xs = train[x].values
-    ys = []
-    labels = []
-    label_map = {
-        "cost_usd_pre_fwd": "pre_fwd",
-        "cost_usd_post_fwd": "post_fwd",
-        "cost_usd_expert_fwd": "expert_fwd",
-        "cost_usd_pre_bwd": "pre_bwd",
-        "cost_usd_post_bwd": "post_bwd",
-        "cost_usd_grad_apply": "grad_apply",
-    }
+    xs = train[x]
+    ys = [rolling_mean(train[c].fillna(0.0), smooth) for c in existing_comps]
 
-    for c in comps:
-        s = rolling_mean(train[c].fillna(0.0), smooth)
-        ys.append(np.nan_to_num(s.values, nan=0.0))
-        labels.append(label_map.get(c, c))
+    fig, ax = plt.subplots(figsize=fig_size(col))
 
-    fig = plt.figure(figsize=fig_size(col, aspect=0.78))
-    ax = fig.add_subplot(111)
-    ax.stackplot(xs, ys, labels=labels)
+    try:
+        pal = mlp.colormaps['Set2'].colors
+    except AttributeError:
+        pal = plt.cm.get_cmap('Set2').colors
 
-    ax.set_xlabel(x)
+    ax.stackplot(xs, *ys, labels=existing_labels, colors=pal, alpha=0.9)
+
+    ax.set_xlabel(x.capitalize())
     ax.set_ylabel("Cost (USD / step)")
-    ax.set_title("Cost Breakdown vs Step")
-    ax.grid(True)
-    ax.legend(frameon=False, ncol=3)
+    ax.set_title("Cost Breakdown")
+    ax.grid(True, linestyle='--', alpha=0.3)
+
+    ax.legend(loc='upper left', frameon=True, fontsize=8, ncol=2)
 
     save_fig(fig, out_dir, "cost_breakdown_vs_step", fmt=fmt, dpi=dpi)
 
@@ -245,63 +267,30 @@ def plot_cost_breakdown(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("
 def plot_deadline(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf", "png")):
     train = fallback_train(df)
 
-    if "deadline_miss" not in train.columns and "deadline_slack_ms" not in train.columns:
-        print("[skip] deadline: deadline_miss/slack not found.")
-        return
-
-    fig = plt.figure(figsize=fig_size(col, aspect=0.78))
-    ax1 = fig.add_subplot(111)
+    fig, ax1 = plt.subplots(figsize=fig_size(col))
 
     if "deadline_miss" in train.columns:
         miss = rolling_mean(train["deadline_miss"].fillna(0.0), smooth)
-        ax1.plot(train[x], miss, label="miss_rate")
-        ax1.set_ylabel("Miss Rate (rolling mean)")
+        ax1.plot(train[x], miss, color=COLORS['loss'], label="Miss Rate")
+        ax1.set_ylabel("Miss Rate")
+        ax1.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
 
     if "deadline_slack_ms" in train.columns:
         ax2 = ax1.twinx()
-        ax2.plot(train[x], rolling_mean(train["deadline_slack_ms"], smooth), linestyle="--", label="slack_ms")
+        slack = rolling_mean(train["deadline_slack_ms"], smooth)
+        ax2.plot(train[x], slack, color=COLORS['train'], linestyle="--", label="Slack (ms)")
         ax2.set_ylabel("Slack (ms)")
+        ax2.axhline(0, color='gray', linestyle=':', linewidth=1)
 
-        h1, l1 = ax1.get_legend_handles_labels()
-        h2, l2 = ax2.get_legend_handles_labels()
-        ax1.legend(h1 + h2, l1 + l2, frameon=False, ncol=2)
-    else:
-        ax1.legend(frameon=False)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = (ax2.get_legend_handles_labels() if "deadline_slack_ms" in train.columns else ([], []))
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='best', frameon=True)
 
-    ax1.set_xlabel(x)
-    ax1.set_title("Deadline Miss Rate / Slack vs Step")
-    ax1.grid(True)
+    ax1.set_xlabel(x.capitalize())
+    ax1.set_title("Deadline Miss Rate & Slack")
+    ax1.grid(True, linestyle='--', alpha=0.5)
 
     save_fig(fig, out_dir, "deadline_vs_step", fmt=fmt, dpi=dpi)
-
-
-def plot_step_time(df, out_dir, x="step", col=1, smooth=10, dpi=600, fmt=("pdf", "png")):
-    """
-    End-to-end step time (key system performance metric for ICWS).
-    """
-    train = df[df.get("phase", "").astype(str).str.lower() == "train"].copy() if "phase" in df.columns else df.copy()
-
-    if "step_time_ms" not in train.columns:
-        print("[skip] step time: step_time_ms not found.")
-        return
-
-    fig = plt.figure(figsize=fig_size(col, aspect=0.72))
-    ax = fig.add_subplot(111)
-
-    ax.plot(
-        train[x],
-        rolling_mean(train["step_time_ms"], smooth),
-        label="step_time",
-        linestyle="-"
-    )
-
-    ax.set_xlabel(x)
-    ax.set_ylabel("Step Time (ms)")
-    ax.set_title("End-to-End Step Time vs Step")
-    ax.grid(True)
-    ax.legend(frameon=False)
-
-    save_fig(fig, out_dir, "step_time_vs_step", fmt=fmt, dpi=dpi)
 
 
 # -------------------------
@@ -317,7 +306,7 @@ def main():
     ap.add_argument("--fmt", type=str, default="pdf,png")
     ap.add_argument("--x", type=str, default="step", choices=["step", "epoch", "step_in_epoch"])
     ap.add_argument("--font", type=str, default="Times New Roman")
-    ap.add_argument("--fontsize", type=int, default=8)
+    ap.add_argument("--fontsize", type=int, default=10)
     args = ap.parse_args()
 
     set_paper_style(font=args.font, base_fontsize=args.fontsize)
@@ -325,7 +314,6 @@ def main():
 
     df = pd.read_csv(args.csv)
 
-    # numeric coercion for required cols
     needed = [
         args.x, "loss", "acc_top5",
         "grad_mode_hot_frac", "grad_mode_cold_frac", "grad_mode_http_frac",
@@ -335,19 +323,17 @@ def main():
     ]
     to_numeric(df, needed)
 
-    # stable sort
     if args.x in df.columns:
         df = df.sort_values([args.x]).reset_index(drop=True)
 
     fmt = tuple([s.strip().lower() for s in args.fmt.split(",") if s.strip()])
 
-    # minimal ICWS figures
+    # Generate plots
     plot_val_loss_ppl(df, args.out_dir, x=args.x, col=args.col, smooth=args.smooth, dpi=args.dpi, fmt=fmt)
     plot_acc5_only(df, args.out_dir, x=args.x, col=args.col, smooth=args.smooth, dpi=args.dpi, fmt=fmt)
     plot_grad_mode_fractions(df, args.out_dir, x=args.x, col=args.col, smooth=args.smooth, dpi=args.dpi, fmt=fmt)
-    plot_cost_breakdown(df, args.out_dir, x=args.x, col=args.col, smooth=max(args.smooth, 10), dpi=args.dpi, fmt=fmt)
-    plot_deadline(df, args.out_dir, x=args.x, col=args.col, smooth=max(args.smooth, 10), dpi=args.dpi, fmt=fmt)
-    plot_step_time(df, args.out_dir, x=args.x, col=args.col, smooth=max(args.smooth, 10), dpi=args.dpi, fmt=fmt)
+    plot_cost_breakdown(df, args.out_dir, x=args.x, col=args.col, smooth=args.smooth, dpi=args.dpi, fmt=fmt)
+    plot_deadline(df, args.out_dir, x=args.x, col=args.col, smooth=args.smooth, dpi=args.dpi, fmt=fmt)
 
 
 if __name__ == "__main__":

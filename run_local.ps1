@@ -132,7 +132,7 @@ Start-Window -command @"
 `$env:EMB_DIM='256';                    # 建议同步（若 controller 读 MOE_CONFIG.d_model 也行）
 
 `$env:BATCH_SIZE='8'; `$env:BLOCK_SIZE='64';
-`$env:MAX_STEPS='500'; `$env:VAL_INTERVAL='100'; `$env:LOG_TRAIN_EVERY='10';
+`$env:MAX_STEPS='2200'; `$env:VAL_INTERVAL='100'; `$env:LOG_TRAIN_EVERY='10';
 
 `$env:MICRO_BATCHES="4"
 `$env:PARALLEL_DEGREE="4"
